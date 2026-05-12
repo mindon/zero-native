@@ -4,7 +4,7 @@
     .display_name = "Browser Example",
     .version = "0.1.0",
     .icons = .{ "assets/icon.icns" },
-    .platforms = .{ "macos", "linux", "windows" },
+    .platforms = .{ "macos", "linux" },
     .permissions = .{ "window" },
     .capabilities = .{ "webview", "js_bridge" },
     .security = .{

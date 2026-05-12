@@ -351,7 +351,7 @@ fn closeWindow(context: ?*anyopaque, window_id: platform_mod.WindowId) anyerror!
 
 fn createWebView(context: ?*anyopaque, options: platform_mod.WebViewOptions) anyerror!void {
     const self: *LinuxPlatform = @ptrCast(@alignCast(context.?));
-    if (self.web_engine == .chromium) return error.UnsupportedService;
+    if (self.web_engine == .chromium) return error.UnsupportedChildWebViews;
     const frame = options.frame;
     if (zero_native_gtk_create_webview(self.host, options.window_id, options.label.ptr, options.label.len, options.url.ptr, options.url.len, frame.x, frame.y, frame.width, frame.height, options.layer, if (options.transparent) 1 else 0, if (options.bridge_enabled) 1 else 0) == 0) return error.CreateFailed;
 }
@@ -368,13 +368,13 @@ fn navigateWebView(context: ?*anyopaque, window_id: platform_mod.WindowId, label
 
 fn setWebViewZoom(context: ?*anyopaque, window_id: platform_mod.WindowId, label: []const u8, zoom: f64) anyerror!void {
     const self: *LinuxPlatform = @ptrCast(@alignCast(context.?));
-    if (self.web_engine == .chromium) return error.UnsupportedService;
+    if (self.web_engine == .chromium) return error.UnsupportedChildWebViews;
     if (zero_native_gtk_set_webview_zoom(self.host, window_id, label.ptr, label.len, zoom) == 0) return error.WebViewNotFound;
 }
 
 fn setWebViewLayer(context: ?*anyopaque, window_id: platform_mod.WindowId, label: []const u8, layer: i32) anyerror!void {
     const self: *LinuxPlatform = @ptrCast(@alignCast(context.?));
-    if (self.web_engine == .chromium) return error.UnsupportedService;
+    if (self.web_engine == .chromium) return error.UnsupportedChildWebViews;
     if (zero_native_gtk_set_webview_layer(self.host, window_id, label.ptr, label.len, layer) == 0) return error.WebViewNotFound;
 }
 

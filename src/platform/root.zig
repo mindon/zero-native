@@ -20,6 +20,11 @@ pub const Error = error{
     DuplicateWebViewLabel,
     WebViewLabelTooLarge,
     WebViewUrlTooLarge,
+    UnsupportedChildWebViews,
+    UnsupportedWebViewBridge,
+    UnsupportedMainWebViewFrame,
+    UnsupportedMainWebViewZoom,
+    UnsupportedMainWebViewLayer,
     NavigationDenied,
 };
 

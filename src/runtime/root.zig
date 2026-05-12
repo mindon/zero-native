@@ -866,10 +866,10 @@ pub const Runtime = struct {
         try validateWebViewLabel(label);
         if (isMainWebViewLabel(label)) return error.InvalidWebViewOptions;
         const webview_index = self.findWebViewIndex(window_id, label) orelse return error.WebViewNotFound;
-        const closing = self.webviews[webview_index];
         try self.options.platform.services.closeWebView(window_id, label);
+        const result = try writeWebViewJson(self.webviews[webview_index], output);
         self.removeWebViewAt(webview_index);
-        return writeWebViewJson(closing, output);
+        return result;
     }
 
     fn validateWebViewParent(self: *Runtime, window_id: platform.WindowId) !void {
@@ -1157,6 +1157,11 @@ fn builtinBridgeErrorMessage(err: anyerror) []const u8 {
         error.ReservedWebViewLabel => "WebView label \"main\" is reserved for the startup WebView",
         error.WebViewLabelTooLarge => "WebView label is too large",
         error.WebViewUrlTooLarge => "WebView URL is too large",
+        error.UnsupportedChildWebViews => "This backend does not support child WebViews yet",
+        error.UnsupportedWebViewBridge => "This backend does not support bridge-enabled child WebViews yet",
+        error.UnsupportedMainWebViewFrame => "This backend does not support resizing the main WebView yet",
+        error.UnsupportedMainWebViewZoom => "This backend does not support zooming the main WebView yet",
+        error.UnsupportedMainWebViewLayer => "This backend does not support changing the main WebView layer",
         error.NavigationDenied => "WebView URL is not allowed by navigation policy",
         error.InvalidWindowOptions => "Window options are invalid",
         error.DuplicateWindowId => "Window id already exists",
@@ -1179,6 +1184,11 @@ fn builtinBridgeErrorCode(err: anyerror) bridge.ErrorCode {
         error.ReservedWebViewLabel,
         error.WebViewLabelTooLarge,
         error.WebViewUrlTooLarge,
+        error.UnsupportedChildWebViews,
+        error.UnsupportedWebViewBridge,
+        error.UnsupportedMainWebViewFrame,
+        error.UnsupportedMainWebViewZoom,
+        error.UnsupportedMainWebViewLayer,
         => .invalid_request,
         error.NavigationDenied => .invalid_request,
         else => .internal_error,
@@ -1641,6 +1651,44 @@ test "runtime handles built-in JavaScript webview bridge commands" {
     try std.testing.expectEqual(@as(usize, 0), harness.null_platform.webview_count);
 }
 
+test "runtime returns closed webview info before compacting storage" {
+    const TestApp = struct {
+        fn app(self: *@This()) App {
+            return .{ .context = self, .name = "webview-close-response", .source = platform.WebViewSource.html("<p>WebView</p>") };
+        }
+    };
+
+    var harness: TestHarness() = undefined;
+    harness.init(.{});
+    harness.runtime.options.js_window_api = true;
+    const webview_origins = [_][]const u8{ "zero://inline", "https://example.com" };
+    harness.runtime.options.security.navigation.allowed_origins = &webview_origins;
+    var app_state: TestApp = .{};
+    try harness.start(app_state.app());
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"first\",\"command\":\"zero-native.webview.create\",\"payload\":{\"label\":\"first\",\"url\":\"https://example.com/first\",\"frame\":{\"width\":300,\"height\":200}}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"second\",\"command\":\"zero-native.webview.create\",\"payload\":{\"label\":\"second\",\"url\":\"https://example.com/second\",\"frame\":{\"width\":300,\"height\":200}}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"close-first\",\"command\":\"zero-native.webview.close\",\"payload\":{\"label\":\"first\"}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"label\":\"first\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"label\":\"second\"") == null);
+    try std.testing.expectEqual(@as(usize, 1), harness.null_platform.webview_count);
+    try std.testing.expectEqualStrings("second", harness.null_platform.webviews[0].label);
+}
+
 test "runtime defaults webview commands to source window" {
     const TestApp = struct {
         fn app(self: *@This()) App {
@@ -1808,6 +1856,19 @@ test "runtime validates webview bridge commands" {
         .window_id = 1,
     } });
     try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"label\":\"preview \\\"quoted\\\"\"") != null);
+}
+
+test "runtime reports actionable unsupported webview capability errors" {
+    try std.testing.expectEqual(bridge.ErrorCode.invalid_request, builtinBridgeErrorCode(error.UnsupportedChildWebViews));
+    try std.testing.expectEqual(bridge.ErrorCode.invalid_request, builtinBridgeErrorCode(error.UnsupportedWebViewBridge));
+    try std.testing.expectEqual(bridge.ErrorCode.invalid_request, builtinBridgeErrorCode(error.UnsupportedMainWebViewFrame));
+    try std.testing.expectEqual(bridge.ErrorCode.invalid_request, builtinBridgeErrorCode(error.UnsupportedMainWebViewZoom));
+    try std.testing.expectEqual(bridge.ErrorCode.invalid_request, builtinBridgeErrorCode(error.UnsupportedMainWebViewLayer));
+    try std.testing.expectEqualStrings("This backend does not support child WebViews yet", builtinBridgeErrorMessage(error.UnsupportedChildWebViews));
+    try std.testing.expectEqualStrings("This backend does not support bridge-enabled child WebViews yet", builtinBridgeErrorMessage(error.UnsupportedWebViewBridge));
+    try std.testing.expectEqualStrings("This backend does not support resizing the main WebView yet", builtinBridgeErrorMessage(error.UnsupportedMainWebViewFrame));
+    try std.testing.expectEqualStrings("This backend does not support zooming the main WebView yet", builtinBridgeErrorMessage(error.UnsupportedMainWebViewZoom));
+    try std.testing.expectEqualStrings("This backend does not support changing the main WebView layer", builtinBridgeErrorMessage(error.UnsupportedMainWebViewLayer));
 }
 
 test "runtime gates JavaScript window API by origin and configured permission" {

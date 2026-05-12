@@ -1,3 +1,4 @@
+const std = @import("std");
 const geometry = @import("geometry");
 const platform_mod = @import("../root.zig");
 const policy_values = @import("../policy_values.zig");
@@ -298,12 +299,14 @@ fn closeWindow(context: ?*anyopaque, window_id: platform_mod.WindowId) anyerror!
 
 fn createWebView(context: ?*anyopaque, options: platform_mod.WebViewOptions) anyerror!void {
     const self: *WindowsPlatform = @ptrCast(@alignCast(context.?));
+    if (options.bridge_enabled) return error.UnsupportedWebViewBridge;
     const frame = options.frame;
     if (zero_native_windows_create_webview(self.host, options.window_id, options.label.ptr, options.label.len, options.url.ptr, options.url.len, frame.x, frame.y, frame.width, frame.height, options.layer, if (options.transparent) 1 else 0, if (options.bridge_enabled) 1 else 0) == 0) return error.CreateFailed;
 }
 
 fn setWebViewFrame(context: ?*anyopaque, window_id: platform_mod.WindowId, label: []const u8, frame: geometry.RectF) anyerror!void {
     const self: *WindowsPlatform = @ptrCast(@alignCast(context.?));
+    if (std.mem.eql(u8, label, "main")) return error.UnsupportedMainWebViewFrame;
     if (zero_native_windows_set_webview_frame(self.host, window_id, label.ptr, label.len, frame.x, frame.y, frame.width, frame.height) == 0) return error.WebViewNotFound;
 }
 
@@ -314,11 +317,13 @@ fn navigateWebView(context: ?*anyopaque, window_id: platform_mod.WindowId, label
 
 fn setWebViewZoom(context: ?*anyopaque, window_id: platform_mod.WindowId, label: []const u8, zoom: f64) anyerror!void {
     const self: *WindowsPlatform = @ptrCast(@alignCast(context.?));
+    if (std.mem.eql(u8, label, "main")) return error.UnsupportedMainWebViewZoom;
     if (zero_native_windows_set_webview_zoom(self.host, window_id, label.ptr, label.len, zoom) == 0) return error.WebViewNotFound;
 }
 
 fn setWebViewLayer(context: ?*anyopaque, window_id: platform_mod.WindowId, label: []const u8, layer: i32) anyerror!void {
     const self: *WindowsPlatform = @ptrCast(@alignCast(context.?));
+    if (std.mem.eql(u8, label, "main")) return error.UnsupportedMainWebViewLayer;
     if (zero_native_windows_set_webview_layer(self.host, window_id, label.ptr, label.len, layer) == 0) return error.WebViewNotFound;
 }
 

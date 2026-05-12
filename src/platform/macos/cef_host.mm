@@ -15,6 +15,7 @@
 #include "include/cef_application_mac.h"
 #include "include/cef_load_handler.h"
 #include "include/cef_process_message.h"
+#include "include/cef_values.h"
 #include "include/cef_v8.h"
 #include "include/wrapper/cef_library_loader.h"
 #include <math.h>
@@ -33,6 +34,7 @@
 namespace {
 
 static const char *kBridgeMessageName = "zero_native_bridge";
+static const char *kBridgeEnabledExtraInfo = "zeroNativeBridgeEnabled";
 static const char *ZeroNativeCefBridgeScript();
 static NSRect ZeroNativeConstrainFrame(NSRect frame);
 static NSString *ZeroNativeResolvedAssetRoot(NSString *rootPath);
@@ -112,9 +114,24 @@ public:
         return this;
     }
 
+    void OnBrowserCreated(CefRefPtr<CefBrowser> browser, CefRefPtr<CefDictionaryValue> extra_info) override {
+        if (!browser) return;
+        bool bridge_enabled = false;
+        if (extra_info && extra_info->HasKey(kBridgeEnabledExtraInfo)) {
+            bridge_enabled = extra_info->GetBool(kBridgeEnabledExtraInfo);
+        }
+        bridge_enabled_by_browser_id_[browser->GetIdentifier()] = bridge_enabled;
+    }
+
+    void OnBrowserDestroyed(CefRefPtr<CefBrowser> browser) override {
+        if (!browser) return;
+        bridge_enabled_by_browser_id_.erase(browser->GetIdentifier());
+    }
+
     void OnContextCreated(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, CefRefPtr<CefV8Context> context) override {
-        (void)browser;
         if (!frame || !frame->IsMain()) return;
+        const auto found = browser ? bridge_enabled_by_browser_id_.find(browser->GetIdentifier()) : bridge_enabled_by_browser_id_.end();
+        if (found == bridge_enabled_by_browser_id_.end() || !found->second) return;
         CefRefPtr<CefV8Value> bridge = CefV8Value::CreateObject(nullptr, nullptr);
         bridge->SetValue("postMessage", CefV8Value::CreateFunction("postMessage", new ZeroNativeCefBridgeV8Handler()), V8_PROPERTY_ATTRIBUTE_READONLY);
         context->GetGlobal()->SetValue("zeroNativeCefBridge", bridge, V8_PROPERTY_ATTRIBUTE_READONLY);
@@ -122,8 +139,15 @@ public:
     }
 
 private:
+    std::map<int, bool> bridge_enabled_by_browser_id_;
     IMPLEMENT_REFCOUNTING(ZeroNativeCefApp);
 };
+
+static CefRefPtr<CefDictionaryValue> ZeroNativeCefExtraInfo(bool bridge_enabled) {
+    CefRefPtr<CefDictionaryValue> extra_info = CefDictionaryValue::Create();
+    extra_info->SetBool(kBridgeEnabledExtraInfo, bridge_enabled);
+    return extra_info;
+}
 
 static bool g_cef_initialized = false;
 static bool g_cef_shutdown = false;
@@ -798,7 +822,7 @@ static const char *ZeroNativeCefBridgeScript() {
     windowInfo.SetAsChild((__bridge void *)container, rect);
     CefBrowserSettings browserSettings;
     CefRefPtr<ZeroNativeCefClient> client = (*self.cefClients)[windowId];
-    CefBrowserHost::CreateBrowser(windowInfo, client.get(), std::string(urlString.UTF8String), browserSettings, nullptr, nullptr);
+    CefBrowserHost::CreateBrowser(windowInfo, client.get(), std::string(urlString.UTF8String), browserSettings, ZeroNativeCefExtraInfo(true), nullptr);
 }
 
 - (NSString *)webViewKeyForWindow:(uint64_t)windowId label:(NSString *)label {
@@ -835,7 +859,7 @@ static const char *ZeroNativeCefBridgeScript() {
     CefRect rect(0, 0, webview.bounds.size.width, webview.bounds.size.height);
     windowInfo.SetAsChild((__bridge void *)webview, rect);
     CefBrowserSettings browserSettings;
-    CefBrowserHost::CreateBrowser(windowInfo, client.get(), std::string(url.UTF8String), browserSettings, nullptr, nullptr);
+    CefBrowserHost::CreateBrowser(windowInfo, client.get(), std::string(url.UTF8String), browserSettings, ZeroNativeCefExtraInfo(bridgeEnabled), nullptr);
     return YES;
 }
 
@@ -1175,11 +1199,13 @@ bool ZeroNativeCefClient::OnProcessMessageReceived(CefRefPtr<CefBrowser> browser
 
     std::string payload = message->GetArgumentList()->GetString(0);
     std::string source_url = frame ? frame->GetURL().ToString() : std::string();
+    std::string label = WebViewLabel();
     NSString *payloadString = [[NSString alloc] initWithBytes:payload.data() length:payload.size() encoding:NSUTF8StringEncoding] ?: @"{}";
     NSString *sourceURLString = [[NSString alloc] initWithBytes:source_url.data() length:source_url.size() encoding:NSUTF8StringEncoding] ?: @"";
-    NSString *originString = [host_ bridgeOriginForWindowId:window_id_ sourceURL:sourceURLString];
-    std::string label = WebViewLabel();
     NSString *labelString = [[NSString alloc] initWithBytes:label.data() length:label.size() encoding:NSUTF8StringEncoding] ?: @"main";
+    NSString *originString = [labelString isEqualToString:@"main"]
+        ? [host_ bridgeOriginForWindowId:window_id_ sourceURL:sourceURLString]
+        : ZeroNativeOriginForURL([NSURL URLWithString:sourceURLString]);
     [host_ receiveBridgePayload:payloadString origin:originString windowId:window_id_ webViewLabel:labelString];
     return true;
 }

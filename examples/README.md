@@ -4,7 +4,7 @@ Use these examples as a progressive path through zero-native:
 
 - `hello` is the smallest desktop shell with inline HTML.
 - `webview` demonstrates bridge commands, built-in window APIs, security policy, automation, and optional CEF.
-- `browser` is a vanilla no-build shell that uses layered WebViews for isolated page content.
+- `browser` is a vanilla no-build shell that uses layered WebViews for isolated page content on macOS and Linux system WebViews.
 - `react`, `svelte`, `vue`, and `next` show framework projects with managed frontend assets and dev-server workflows.
 - `ios` and `android` show how mobile hosts link the zero-native C ABI from `libzero-native.a`.
 
