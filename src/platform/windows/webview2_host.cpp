@@ -1,12 +1,27 @@
 #include <windows.h>
 #include <shellapi.h>
+#include <objbase.h>
 
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include <climits>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <vector>
+
+#if __has_include(<WebView2.h>) && __has_include(<wrl.h>)
+#include <WebView2.h>
+#include <wrl.h>
+#define ZERO_NATIVE_HAS_WEBVIEW2 1
+using Microsoft::WRL::Callback;
+using Microsoft::WRL::ComPtr;
+#else
+#define ZERO_NATIVE_HAS_WEBVIEW2 0
+#endif
 
 namespace {
 
@@ -35,7 +50,7 @@ struct WindowsEvent {
 };
 
 using EventCallback = void (*)(void *, const WindowsEvent *);
-using BridgeCallback = void (*)(void *, uint64_t, const char *, size_t, const char *, size_t);
+using BridgeCallback = void (*)(void *, uint64_t, const char *, size_t, const char *, size_t, const char *, size_t);
 
 struct Window {
     uint64_t id = 1;
@@ -46,6 +61,31 @@ struct Window {
     double y = 0;
     double width = 720;
     double height = 480;
+};
+
+struct ChildWebView {
+    uint64_t window_id = 1;
+    HWND hwnd = nullptr;
+    std::string label;
+    std::string url;
+    double x = 0;
+    double y = 0;
+    double width = 0;
+    double height = 0;
+    double zoom = 1.0;
+    int layer = 0;
+    uint64_t creation_order = 0;
+    bool transparent = false;
+    bool bridge_enabled = false;
+#if ZERO_NATIVE_HAS_WEBVIEW2
+    ComPtr<ICoreWebView2Controller> controller;
+    ComPtr<ICoreWebView2> webview;
+#endif
+};
+
+struct HostLifetime {
+    std::recursive_mutex mutex;
+    bool alive = true;
 };
 
 struct Host {
@@ -60,6 +100,12 @@ struct Host {
     void *bridge_context = nullptr;
     bool running = false;
     std::map<uint64_t, Window> windows;
+    std::map<std::string, ChildWebView> webviews;
+    uint64_t next_webview_order = 1;
+    std::vector<std::string> allowed_origins;
+    std::vector<std::string> allowed_external_urls;
+    int external_link_action = 0;
+    std::shared_ptr<HostLifetime> lifetime = std::make_shared<HostLifetime>();
 };
 
 static std::string slice(const char *bytes, size_t len) {
@@ -72,6 +118,57 @@ static std::wstring widen(const std::string &value) {
     std::wstring out((size_t)count, L'\0');
     MultiByteToWideChar(CP_UTF8, 0, value.data(), (int)value.size(), out.data(), count);
     return out;
+}
+
+static std::string narrow(const std::wstring &value) {
+    if (value.empty()) return std::string();
+    int count = WideCharToMultiByte(CP_UTF8, 0, value.data(), (int)value.size(), nullptr, 0, nullptr, nullptr);
+    std::string out((size_t)count, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, value.data(), (int)value.size(), out.data(), count, nullptr, nullptr);
+    return out;
+}
+
+static std::vector<std::string> parseNewlineList(const char *bytes, size_t len) {
+    std::vector<std::string> result;
+    if (!bytes || len == 0) return result;
+    const char *start = bytes;
+    const char *end = bytes + len;
+    while (start < end) {
+        const char *nl = static_cast<const char *>(memchr(start, '\n', (size_t)(end - start)));
+        size_t seg_len = nl ? (size_t)(nl - start) : (size_t)(end - start);
+        while (seg_len > 0 && (*start == ' ' || *start == '\t')) {
+            ++start;
+            --seg_len;
+        }
+        while (seg_len > 0 && (start[seg_len - 1] == ' ' || start[seg_len - 1] == '\t' || start[seg_len - 1] == '\r')) --seg_len;
+        if (seg_len > 0) result.emplace_back(start, seg_len);
+        start = nl ? nl + 1 : end;
+    }
+    return result;
+}
+
+static std::string originForUrl(const std::string &url) {
+    if (url.empty() || url.rfind("about:", 0) == 0) return "zero://inline";
+    size_t scheme_end = url.find("://");
+    if (scheme_end == std::string::npos) return "zero://inline";
+    if (url.compare(0, scheme_end, "file") == 0) return "file://local";
+    size_t host_start = scheme_end + 3;
+    size_t host_end = host_start;
+    while (host_end < url.size() && url[host_end] != '/' && url[host_end] != '?' && url[host_end] != '#') ++host_end;
+    if (host_end == host_start) return url.substr(0, scheme_end) + "://local";
+    return url.substr(0, host_end);
+}
+
+static bool policyListMatches(const std::vector<std::string> &values, const std::string &url) {
+    std::string origin = originForUrl(url);
+    for (const std::string &value : values) {
+        if (value == "*" || value == origin || value == url) return true;
+        if (!value.empty() && value.back() == '*') {
+            const std::string prefix = value.substr(0, value.size() - 1);
+            if (url.rfind(prefix, 0) == 0 || origin.rfind(prefix, 0) == 0) return true;
+        }
+    }
+    return false;
 }
 
 static size_t boundedLen(const char *text, size_t limit) {
@@ -99,6 +196,177 @@ static void emit(Host *host, const Window &window, EventKind kind) {
     event.title = window.title.c_str();
     event.title_len = window.title.size();
     host->callback(host->callback_context, &event);
+}
+
+static std::string webViewKey(uint64_t window_id, const std::string &label) {
+    return std::to_string(window_id) + ":" + label;
+}
+
+static int webViewCoord(double value) {
+    return value > 0 ? (int)(value + 0.5) : 0;
+}
+
+static int webViewExtent(double value) {
+    return value > 1 ? (int)(value + 0.5) : 1;
+}
+
+static bool validChildWebViewFrame(double x, double y, double width, double height) {
+    return x >= 0 && y >= 0 && width > 0 && height > 0;
+}
+
+static void destroyChildWebViewsForWindow(Host *host, uint64_t window_id) {
+    if (!host) return;
+    for (auto it = host->webviews.begin(); it != host->webviews.end();) {
+        if (it->second.window_id == window_id) {
+#if ZERO_NATIVE_HAS_WEBVIEW2
+            if (it->second.controller) it->second.controller->Close();
+#endif
+            if (it->second.hwnd) DestroyWindow(it->second.hwnd);
+            it = host->webviews.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+static void destroyAllWindows(Host *host) {
+    if (!host) return;
+    for (auto &entry : host->windows) {
+        destroyChildWebViewsForWindow(host, entry.first);
+        if (entry.second.hwnd) {
+            DestroyWindow(entry.second.hwnd);
+            entry.second.hwnd = nullptr;
+        }
+    }
+}
+
+#if ZERO_NATIVE_HAS_WEBVIEW2
+using CreateEnvironmentFn = HRESULT (STDAPICALLTYPE *)(PCWSTR, PCWSTR, ICoreWebView2EnvironmentOptions *, ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler *);
+
+static RECT webViewRect(const ChildWebView &webview) {
+    RECT rect = {};
+    rect.left = 0;
+    rect.top = 0;
+    rect.right = webViewExtent(webview.width);
+    rect.bottom = webViewExtent(webview.height);
+    return rect;
+}
+
+static CreateEnvironmentFn webView2Factory() {
+    static HMODULE loader = LoadLibraryW(L"WebView2Loader.dll");
+    if (!loader) return nullptr;
+    return reinterpret_cast<CreateEnvironmentFn>(GetProcAddress(loader, "CreateCoreWebView2EnvironmentWithOptions"));
+}
+
+static void cleanupPendingChildWebView(Host *host, const std::string &key) {
+    if (!host) return;
+    auto found = host->webviews.find(key);
+    if (found == host->webviews.end()) return;
+    if (found->second.controller) found->second.controller->Close();
+    if (found->second.hwnd) DestroyWindow(found->second.hwnd);
+    host->webviews.erase(found);
+}
+
+static bool createChildWebView(Host *host, const std::string &key) {
+    auto factory = webView2Factory();
+    if (!factory) return false;
+    auto found = host->webviews.find(key);
+    if (found == host->webviews.end() || !found->second.hwnd) return false;
+    HWND parent = found->second.hwnd;
+    std::weak_ptr<HostLifetime> lifetime = host->lifetime;
+    HRESULT hr = factory(nullptr, nullptr, nullptr, Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
+        [host, key, parent, lifetime](HRESULT result, ICoreWebView2Environment *environment) -> HRESULT {
+            auto token = lifetime.lock();
+            if (!token) return S_OK;
+            std::lock_guard<std::recursive_mutex> guard(token->mutex);
+            if (!token->alive) return S_OK;
+            auto found = host->webviews.find(key);
+            if (found == host->webviews.end() || found->second.hwnd != parent || !IsWindow(parent)) return S_OK;
+            if (FAILED(result) || !environment) {
+                cleanupPendingChildWebView(host, key);
+                return result;
+            }
+            return environment->CreateCoreWebView2Controller(parent, Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
+                [host, key, lifetime](HRESULT controller_result, ICoreWebView2Controller *controller) -> HRESULT {
+                    auto token = lifetime.lock();
+                    if (!token) {
+                        if (controller) controller->Close();
+                        return S_OK;
+                    }
+                    std::lock_guard<std::recursive_mutex> guard(token->mutex);
+                    if (!token->alive) {
+                        if (controller) controller->Close();
+                        return S_OK;
+                    }
+                    if (FAILED(controller_result) || !controller) {
+                        cleanupPendingChildWebView(host, key);
+                        return controller_result;
+                    }
+                    auto found = host->webviews.find(key);
+                    if (found == host->webviews.end()) {
+                        controller->Close();
+                        return S_OK;
+                    }
+                    found->second.controller = controller;
+                    controller->get_CoreWebView2(&found->second.webview);
+                    RECT bounds = webViewRect(found->second);
+                    controller->put_Bounds(bounds);
+                    controller->put_ZoomFactor(found->second.zoom);
+                    controller->put_IsVisible(TRUE);
+                    if (found->second.webview) {
+                        EventRegistrationToken token = {};
+                        found->second.webview->add_NavigationStarting(Callback<ICoreWebView2NavigationStartingEventHandler>(
+                            [host, lifetime](ICoreWebView2 *, ICoreWebView2NavigationStartingEventArgs *args) -> HRESULT {
+                                auto token = lifetime.lock();
+                                if (!token) return S_OK;
+                                std::lock_guard<std::recursive_mutex> guard(token->mutex);
+                                if (!token->alive) return S_OK;
+                                LPWSTR uri_bytes = nullptr;
+                                if (!args || FAILED(args->get_Uri(&uri_bytes))) return S_OK;
+                                std::wstring uri_wide = uri_bytes ? std::wstring(uri_bytes) : std::wstring();
+                                if (uri_bytes) CoTaskMemFree(uri_bytes);
+                                std::string uri = narrow(uri_wide);
+                                if (uri.empty() || uri.rfind("about:", 0) == 0 || policyListMatches(host->allowed_origins, uri)) return S_OK;
+                                if (host->external_link_action == 1 && policyListMatches(host->allowed_external_urls, uri)) {
+                                    ShellExecuteW(nullptr, L"open", uri_wide.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                                }
+                                args->put_Cancel(TRUE);
+                                return S_OK;
+                            }).Get(), &token);
+                        std::wstring latest_url = widen(found->second.url);
+                        if (!latest_url.empty()) found->second.webview->Navigate(latest_url.c_str());
+                    }
+                    return S_OK;
+                }).Get());
+        }).Get());
+    return SUCCEEDED(hr);
+}
+#endif
+
+static void applyChildWebViewLayer(Host *host, uint64_t window_id, const std::string &label) {
+    if (!host) return;
+    auto found = host->webviews.find(webViewKey(window_id, label));
+    if (found == host->webviews.end() || !found->second.hwnd) return;
+    HWND insert_after = HWND_TOP;
+    bool found_above = false;
+    int best_layer = INT_MAX;
+    uint64_t best_order = UINT64_MAX;
+    for (auto &entry : host->webviews) {
+        const ChildWebView &candidate = entry.second;
+        if (candidate.window_id != window_id || candidate.label == label || !candidate.hwnd) continue;
+        const bool candidate_above = candidate.layer > found->second.layer ||
+            (candidate.layer == found->second.layer && candidate.creation_order > found->second.creation_order);
+        if (!candidate_above) continue;
+        if (!found_above ||
+            candidate.layer < best_layer ||
+            (candidate.layer == best_layer && candidate.creation_order < best_order)) {
+            insert_after = candidate.hwnd;
+            found_above = true;
+            best_layer = candidate.layer;
+            best_order = candidate.creation_order;
+        }
+    }
+    SetWindowPos(found->second.hwnd, insert_after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
 
 static Host *hostFromWindow(HWND hwnd) {
@@ -141,6 +409,7 @@ static LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wparam, LPARA
             if (host) {
                 for (auto &entry : host->windows) {
                     if (entry.second.hwnd == hwnd) {
+                        destroyChildWebViewsForWindow(host, entry.first);
                         entry.second.hwnd = nullptr;
                         emit(host, entry.second, kWindowFrame);
                     }
@@ -217,6 +486,10 @@ Host *zero_native_windows_create(const char *app_name, size_t app_name_len, cons
 
 void zero_native_windows_destroy(Host *host) {
     if (!host) return;
+    std::shared_ptr<HostLifetime> lifetime = host->lifetime;
+    std::lock_guard<std::recursive_mutex> guard(lifetime->mutex);
+    lifetime->alive = false;
+    destroyAllWindows(host);
     delete host;
 }
 
@@ -288,6 +561,15 @@ void zero_native_windows_bridge_respond_window(Host *host, uint64_t window_id, c
     (void)response_len;
 }
 
+void zero_native_windows_bridge_respond_webview(Host *host, uint64_t window_id, const char *webview_label, size_t webview_label_len, const char *response, size_t response_len) {
+    (void)host;
+    (void)window_id;
+    (void)webview_label;
+    (void)webview_label_len;
+    (void)response;
+    (void)response_len;
+}
+
 void zero_native_windows_emit_window_event(Host *host, uint64_t window_id, const char *name, size_t name_len, const char *detail_json, size_t detail_json_len) {
     (void)host;
     (void)window_id;
@@ -298,12 +580,10 @@ void zero_native_windows_emit_window_event(Host *host, uint64_t window_id, const
 }
 
 void zero_native_windows_set_security_policy(Host *host, const char *allowed_origins, size_t allowed_origins_len, const char *external_urls, size_t external_urls_len, int external_action) {
-    (void)host;
-    (void)allowed_origins;
-    (void)allowed_origins_len;
-    (void)external_urls;
-    (void)external_urls_len;
-    (void)external_action;
+    if (!host) return;
+    host->allowed_origins = parseNewlineList(allowed_origins, allowed_origins_len);
+    host->allowed_external_urls = parseNewlineList(external_urls, external_urls_len);
+    host->external_link_action = external_action;
 }
 
 int zero_native_windows_create_window(Host *host, uint64_t window_id, const char *window_title, size_t window_title_len, const char *window_label, size_t window_label_len, double x, double y, double width, double height, int restore_frame) {
@@ -318,8 +598,9 @@ int zero_native_windows_create_window(Host *host, uint64_t window_id, const char
     window.width = width;
     window.height = height;
     bool ok = createNativeWindow(host, window);
+    if (!ok) return 0;
     host->windows[window_id] = window;
-    return ok ? 1 : 0;
+    return 1;
 }
 
 int zero_native_windows_focus_window(Host *host, uint64_t window_id) {
@@ -335,7 +616,160 @@ int zero_native_windows_close_window(Host *host, uint64_t window_id) {
     if (!host) return 0;
     auto found = host->windows.find(window_id);
     if (found == host->windows.end() || !found->second.hwnd) return 0;
+    destroyChildWebViewsForWindow(host, window_id);
     DestroyWindow(found->second.hwnd);
+    return 1;
+}
+
+int zero_native_windows_create_webview(Host *host, uint64_t window_id, const char *label, size_t label_len, const char *url, size_t url_len, double x, double y, double width, double height, int layer, int transparent, int bridge_enabled) {
+#if !ZERO_NATIVE_HAS_WEBVIEW2
+    (void)host;
+    (void)window_id;
+    (void)label;
+    (void)label_len;
+    (void)url;
+    (void)url_len;
+    (void)x;
+    (void)y;
+    (void)width;
+    (void)height;
+    (void)layer;
+    (void)transparent;
+    (void)bridge_enabled;
+    return 0;
+#else
+    if (!host || label_len == 0 || url_len == 0 || !validChildWebViewFrame(x, y, width, height) || bridge_enabled) return 0;
+    auto window = host->windows.find(window_id);
+    if (window == host->windows.end() || !window->second.hwnd) return 0;
+    std::string label_string = slice(label, label_len);
+    std::string key = webViewKey(window_id, label_string);
+    if (host->webviews.find(key) != host->webviews.end()) return 0;
+
+    std::string url_string = slice(url, url_len);
+    HWND hwnd = CreateWindowExW(
+        0,
+        L"STATIC",
+        L"",
+        WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
+        webViewCoord(x),
+        webViewCoord(y),
+        webViewExtent(width),
+        webViewExtent(height),
+        window->second.hwnd,
+        nullptr,
+        host->instance,
+        nullptr);
+    if (!hwnd) return 0;
+
+    ChildWebView webview;
+    webview.window_id = window_id;
+    webview.hwnd = hwnd;
+    webview.label = label_string;
+    webview.url = url_string;
+    webview.x = x;
+    webview.y = y;
+    webview.width = width;
+    webview.height = height;
+    webview.layer = layer;
+    webview.creation_order = host->next_webview_order++;
+    webview.transparent = transparent != 0;
+    webview.bridge_enabled = bridge_enabled != 0;
+    host->webviews[key] = webview;
+    applyChildWebViewLayer(host, window_id, label_string);
+    if (!createChildWebView(host, key)) {
+        DestroyWindow(hwnd);
+        host->webviews.erase(key);
+        return 0;
+    }
+    return 1;
+#endif
+}
+
+int zero_native_windows_set_webview_frame(Host *host, uint64_t window_id, const char *label, size_t label_len, double x, double y, double width, double height) {
+    if (!host || label_len == 0 || !validChildWebViewFrame(x, y, width, height)) return 0;
+    if (slice(label, label_len) == "main") return 1;
+    auto found = host->webviews.find(webViewKey(window_id, slice(label, label_len)));
+    if (found == host->webviews.end() || !found->second.hwnd) return 0;
+    found->second.x = x;
+    found->second.y = y;
+    found->second.width = width;
+    found->second.height = height;
+    MoveWindow(found->second.hwnd, webViewCoord(x), webViewCoord(y), webViewExtent(width), webViewExtent(height), TRUE);
+#if ZERO_NATIVE_HAS_WEBVIEW2
+    if (found->second.controller) {
+        RECT bounds = webViewRect(found->second);
+        found->second.controller->put_Bounds(bounds);
+    }
+#endif
+    return 1;
+}
+
+int zero_native_windows_navigate_webview(Host *host, uint64_t window_id, const char *label, size_t label_len, const char *url, size_t url_len) {
+#if !ZERO_NATIVE_HAS_WEBVIEW2
+    (void)host;
+    (void)window_id;
+    (void)label;
+    (void)label_len;
+    (void)url;
+    (void)url_len;
+    return 0;
+#else
+    if (!host || label_len == 0 || url_len == 0) return 0;
+    auto found = host->webviews.find(webViewKey(window_id, slice(label, label_len)));
+    if (found == host->webviews.end() || !found->second.hwnd) return 0;
+    found->second.url = slice(url, url_len);
+    if (found->second.webview) {
+        std::wstring target = widen(found->second.url);
+        found->second.webview->Navigate(target.c_str());
+        return 1;
+    }
+    // WebView2 initializes asynchronously; keep the newest URL and apply it in the creation callback.
+    return 1;
+#endif
+}
+
+int zero_native_windows_set_webview_zoom(Host *host, uint64_t window_id, const char *label, size_t label_len, double zoom) {
+#if !ZERO_NATIVE_HAS_WEBVIEW2
+    (void)host;
+    (void)window_id;
+    (void)label;
+    (void)label_len;
+    (void)zoom;
+    return 0;
+#else
+    if (!host || label_len == 0 || zoom < 0.25 || zoom > 5.0) return 0;
+    std::string label_string = slice(label, label_len);
+    if (label_string == "main") return 0;
+    auto found = host->webviews.find(webViewKey(window_id, label_string));
+    if (found == host->webviews.end() || !found->second.hwnd) return 0;
+    found->second.zoom = zoom;
+    if (found->second.controller) {
+        found->second.controller->put_ZoomFactor(zoom);
+    }
+    return 1;
+#endif
+}
+
+int zero_native_windows_set_webview_layer(Host *host, uint64_t window_id, const char *label, size_t label_len, int layer) {
+    if (!host || label_len == 0) return 0;
+    std::string label_string = slice(label, label_len);
+    if (label_string == "main") return 0;
+    auto found = host->webviews.find(webViewKey(window_id, label_string));
+    if (found == host->webviews.end() || !found->second.hwnd) return 0;
+    found->second.layer = layer;
+    applyChildWebViewLayer(host, window_id, label_string);
+    return 1;
+}
+
+int zero_native_windows_close_webview(Host *host, uint64_t window_id, const char *label, size_t label_len) {
+    if (!host || label_len == 0) return 0;
+    auto found = host->webviews.find(webViewKey(window_id, slice(label, label_len)));
+    if (found == host->webviews.end()) return 0;
+#if ZERO_NATIVE_HAS_WEBVIEW2
+    if (found->second.controller) found->second.controller->Close();
+#endif
+    if (found->second.hwnd) DestroyWindow(found->second.hwnd);
+    host->webviews.erase(found);
     return 1;
 }
 

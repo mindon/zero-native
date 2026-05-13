@@ -37,7 +37,7 @@ struct OpenDialogResult {
 };
 
 using EventCallback = void (*)(void *, const GtkEvent *);
-using BridgeCallback = void (*)(void *, uint64_t, const char *, size_t, const char *, size_t);
+using BridgeCallback = void (*)(void *, uint64_t, const char *, size_t, const char *, size_t, const char *, size_t);
 
 struct Window {
     uint64_t id = 1;
@@ -51,6 +51,17 @@ struct Window {
     bool focused = false;
 };
 
+struct ChildWebView {
+    uint64_t window_id = 1;
+    std::string label;
+    std::string url;
+    double x = 0;
+    double y = 0;
+    double width = 0;
+    double height = 0;
+    bool open = false;
+};
+
 struct Host {
     std::string app_name;
     std::string window_title;
@@ -60,6 +71,7 @@ struct Host {
     void *bridge_context = nullptr;
     bool running = false;
     std::map<uint64_t, Window> windows;
+    std::map<std::string, ChildWebView> webviews;
 };
 
 static std::string slice(const char *bytes, size_t len) {
@@ -83,6 +95,25 @@ static void emit(Host *host, const Window &window, EventKind kind) {
     event.title = window.title.c_str();
     event.title_len = window.title.size();
     host->callback(host->callback_context, &event);
+}
+
+static std::string webViewKey(uint64_t window_id, const std::string &label) {
+    return std::to_string(window_id) + ":" + label;
+}
+
+static bool validChildWebViewFrame(double x, double y, double width, double height) {
+    return x >= 0 && y >= 0 && width > 0 && height > 0;
+}
+
+static void destroyChildWebViewsForWindow(Host *host, uint64_t window_id) {
+    if (!host) return;
+    for (auto it = host->webviews.begin(); it != host->webviews.end();) {
+        if (it->second.window_id == window_id) {
+            it = host->webviews.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 } // namespace
@@ -178,6 +209,15 @@ void zero_native_gtk_bridge_respond_window(Host *host, uint64_t window_id, const
     (void)response_len;
 }
 
+void zero_native_gtk_bridge_respond_webview(Host *host, uint64_t window_id, const char *webview_label, size_t webview_label_len, const char *response, size_t response_len) {
+    (void)host;
+    (void)window_id;
+    (void)webview_label;
+    (void)webview_label_len;
+    (void)response;
+    (void)response_len;
+}
+
 void zero_native_gtk_emit_window_event(Host *host, uint64_t window_id, const char *name, size_t name_len, const char *detail_json, size_t detail_json_len) {
     (void)host;
     (void)window_id;
@@ -226,9 +266,75 @@ int zero_native_gtk_close_window(Host *host, uint64_t window_id) {
     if (!host) return 0;
     auto found = host->windows.find(window_id);
     if (found == host->windows.end()) return 0;
+    destroyChildWebViewsForWindow(host, window_id);
     found->second.open = false;
     emit(host, found->second, kWindowFrame);
     return 1;
+}
+
+int zero_native_gtk_create_webview(Host *host, uint64_t window_id, const char *label, size_t label_len, const char *url, size_t url_len, double x, double y, double width, double height, int layer, int transparent, int bridge_enabled) {
+    (void)host;
+    (void)window_id;
+    (void)label;
+    (void)label_len;
+    (void)url;
+    (void)url_len;
+    (void)x;
+    (void)y;
+    (void)width;
+    (void)height;
+    (void)layer;
+    (void)transparent;
+    (void)bridge_enabled;
+    return 0;
+}
+
+int zero_native_gtk_set_webview_frame(Host *host, uint64_t window_id, const char *label, size_t label_len, double x, double y, double width, double height) {
+    (void)host;
+    (void)window_id;
+    (void)label;
+    (void)label_len;
+    (void)x;
+    (void)y;
+    (void)width;
+    (void)height;
+    return 0;
+}
+
+int zero_native_gtk_navigate_webview(Host *host, uint64_t window_id, const char *label, size_t label_len, const char *url, size_t url_len) {
+    (void)host;
+    (void)window_id;
+    (void)label;
+    (void)label_len;
+    (void)url;
+    (void)url_len;
+    return 0;
+}
+
+int zero_native_gtk_set_webview_zoom(Host *host, uint64_t window_id, const char *label, size_t label_len, double zoom) {
+    (void)host;
+    (void)window_id;
+    (void)label;
+    (void)label_len;
+    (void)zoom;
+    return 0;
+}
+
+int zero_native_gtk_set_webview_layer(Host *host, uint64_t window_id, const char *label, size_t label_len, int layer) {
+    (void)host;
+    (void)window_id;
+    (void)label;
+    (void)label_len;
+    (void)layer;
+    return 0;
+}
+
+int zero_native_gtk_close_webview(Host *host, uint64_t window_id, const char *label, size_t label_len) {
+    (void)host;
+    (void)window_id;
+    (void)label;
+    (void)label_len;
+    return 0;
 }
 
 size_t zero_native_gtk_clipboard_read(Host *host, char *buffer, size_t buffer_len) {

@@ -8,6 +8,7 @@
 
 @class ZeroNativeAppKitHost;
 
+static const NSUInteger ZeroNativeMaxChildWebViews = 16;
 static NSRect constrainFrame(NSRect frame);
 static NSString *ZeroNativeAppKitBridgeScript(void);
 static NSString *ZeroNativeMimeTypeForPath(NSString *path);
@@ -23,9 +24,14 @@ static BOOL ZeroNativePolicyListMatches(NSArray<NSString *> *values, NSURL *url)
 @property(nonatomic, assign) uint64_t windowId;
 @end
 
+@interface ZeroNativeWebView : WKWebView
+@property(nonatomic, strong) NSArray<NSValue *> *coveredMouseRects;
+@end
+
 @interface ZeroNativeBridgeScriptHandler : NSObject <WKScriptMessageHandler>
 @property(nonatomic, assign) ZeroNativeAppKitHost *host;
 @property(nonatomic, assign) uint64_t windowId;
+@property(nonatomic, strong) NSString *webViewLabel;
 @end
 
 @interface ZeroNativeAssetSchemeHandler : NSObject <WKURLSchemeHandler>
@@ -47,6 +53,8 @@ static BOOL ZeroNativePolicyListMatches(NSArray<NSString *> *values, NSURL *url)
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, ZeroNativeBridgeScriptHandler *> *bridgeScriptHandlers;
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, ZeroNativeAssetSchemeHandler *> *assetSchemeHandlers;
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSString *> *windowLabels;
+@property(nonatomic, strong) NSMutableDictionary<NSString *, WKWebView *> *childWebViews;
+@property(nonatomic, strong) NSMutableSet<NSString *> *bridgeEnabledChildWebViewKeys;
 @property(nonatomic, strong) NSTimer *timer;
 @property(nonatomic, strong) NSString *appName;
 @property(nonatomic, strong) NSString *bundleIdentifier;
@@ -57,6 +65,8 @@ static BOOL ZeroNativePolicyListMatches(NSArray<NSString *> *values, NSURL *url)
 @property(nonatomic, assign) void *context;
 @property(nonatomic, assign) void *bridgeContext;
 @property(nonatomic, assign) BOOL didShutdown;
+@property(nonatomic, assign) NSInteger bridgeFrameKeepalive;
+@property(nonatomic, strong) id shortcutEventMonitor;
 @property(nonatomic, strong) NSStatusItem *statusItem;
 @property(nonatomic, assign) zero_native_appkit_tray_callback_t trayCallback;
 @property(nonatomic, assign) void *trayContext;
@@ -68,7 +78,20 @@ static BOOL ZeroNativePolicyListMatches(NSArray<NSString *> *values, NSURL *url)
 - (void)focusWindowWithId:(uint64_t)windowId;
 - (void)closeWindowWithId:(uint64_t)windowId;
 - (WKWebView *)webViewForWindowId:(uint64_t)windowId;
+- (WKWebView *)mainWebViewForWindow:(NSWindow *)window;
 - (ZeroNativeAssetSchemeHandler *)assetHandlerForWindowId:(uint64_t)windowId;
+- (BOOL)createWebViewInWindow:(uint64_t)windowId label:(NSString *)label url:(NSString *)url x:(double)x y:(double)y width:(double)width height:(double)height layer:(NSInteger)layer transparent:(BOOL)transparent bridgeEnabled:(BOOL)bridgeEnabled;
+- (BOOL)setWebViewFrameInWindow:(uint64_t)windowId label:(NSString *)label x:(double)x y:(double)y width:(double)width height:(double)height;
+- (BOOL)navigateWebViewInWindow:(uint64_t)windowId label:(NSString *)label url:(NSString *)url;
+- (BOOL)setWebViewZoomInWindow:(uint64_t)windowId label:(NSString *)label zoom:(double)zoom;
+- (BOOL)setWebViewLayerInWindow:(uint64_t)windowId label:(NSString *)label layer:(NSInteger)layer;
+- (BOOL)closeWebViewInWindow:(uint64_t)windowId label:(NSString *)label;
+- (void)closeWebViewsInWindow:(uint64_t)windowId;
+- (void)reorderWebViewsInWindow:(uint64_t)windowId;
+- (void)updateCoveredMouseRectsInWindow:(uint64_t)windowId;
+- (void)applyCoveredMouseRects:(NSArray<NSValue *> *)rects toWebView:(WKWebView *)webView;
+- (void)removeBridgeHandlerForChildWebView:(WKWebView *)webView key:(NSString *)key;
+- (void)removeAllChildBridgeHandlers;
 - (void)configureApplication;
 - (void)buildMenuBar;
 - (NSMenuItem *)menuItem:(NSString *)title action:(SEL)action key:(NSString *)key modifiers:(NSEventModifierFlags)modifiers;
@@ -77,9 +100,11 @@ static BOOL ZeroNativePolicyListMatches(NSArray<NSString *> *values, NSURL *url)
 - (void)emitEvent:(zero_native_appkit_event_t)event;
 - (void)emitResize;
 - (void)emitResizeForWindowId:(uint64_t)windowId;
+- (void)emitDeferredResizeForWindowId:(uint64_t)windowId;
 - (void)emitWindowFrame:(BOOL)open;
 - (void)emitWindowFrameForWindowId:(uint64_t)windowId open:(BOOL)open;
 - (void)scheduleFrame;
+- (void)scheduleBridgeFrames;
 - (void)emitFrame;
 - (void)emitShutdown;
 - (void)loadSource:(NSString *)source kind:(NSInteger)kind assetRoot:(NSString *)assetRoot entry:(NSString *)entry origin:(NSString *)origin spaFallback:(BOOL)spaFallback;
@@ -87,10 +112,13 @@ static BOOL ZeroNativePolicyListMatches(NSArray<NSString *> *values, NSURL *url)
 - (void)setAllowedNavigationOrigins:(NSArray<NSString *> *)origins externalURLs:(NSArray<NSString *> *)externalURLs externalAction:(NSInteger)externalAction;
 - (BOOL)allowsNavigationURL:(NSURL *)url;
 - (BOOL)openExternalURLIfAllowed:(NSURL *)url;
-- (void)receiveBridgeMessage:(WKScriptMessage *)message windowId:(uint64_t)windowId;
+- (void)emitNavigationForWebView:(WKWebView *)webView url:(NSURL *)url;
+- (void)receiveBridgeMessage:(WKScriptMessage *)message windowId:(uint64_t)windowId webViewLabel:(NSString *)webViewLabel;
 - (void)completeBridgeWithResponse:(NSString *)response;
 - (void)completeBridgeWithResponse:(NSString *)response windowId:(uint64_t)windowId;
+- (void)completeBridgeWithResponse:(NSString *)response windowId:(uint64_t)windowId webViewLabel:(NSString *)webViewLabel;
 - (void)emitEventNamed:(NSString *)name detailJSON:(NSString *)detailJSON windowId:(uint64_t)windowId;
+- (BOOL)handleShortcutEvent:(NSEvent *)event;
 @end
 
 @implementation ZeroNativeWindowDelegate
@@ -99,6 +127,7 @@ static BOOL ZeroNativePolicyListMatches(NSArray<NSString *> *values, NSURL *url)
     (void)notification;
     [self.host emitWindowFrameForWindowId:self.windowId open:YES];
     [self.host emitResizeForWindowId:self.windowId];
+    [self.host emitDeferredResizeForWindowId:self.windowId];
     [self.host scheduleFrame];
 }
 
@@ -111,12 +140,15 @@ static BOOL ZeroNativePolicyListMatches(NSArray<NSString *> *values, NSURL *url)
 - (void)windowDidBecomeKey:(NSNotification *)notification {
     (void)notification;
     [self.host emitWindowFrameForWindowId:self.windowId open:YES];
+    [self.host emitResizeForWindowId:self.windowId];
+    [self.host emitDeferredResizeForWindowId:self.windowId];
     [self.host scheduleFrame];
 }
 
 - (void)windowWillClose:(NSNotification *)notification {
     (void)notification;
     [self.host emitWindowFrameForWindowId:self.windowId open:NO];
+    [self.host closeWebViewsInWindow:self.windowId];
     NSNumber *key = @(self.windowId);
     [self.host.windows removeObjectForKey:key];
     [self.host.webViews removeObjectForKey:key];
@@ -132,11 +164,42 @@ static BOOL ZeroNativePolicyListMatches(NSArray<NSString *> *values, NSURL *url)
 
 @end
 
+@implementation ZeroNativeWebView
+
+- (BOOL)pointIsCovered:(NSPoint)point {
+    for (NSValue *value in self.coveredMouseRects) {
+        if (NSPointInRect(point, value.rectValue)) return YES;
+    }
+    return NO;
+}
+
+- (BOOL)eventIsCovered:(NSEvent *)event {
+    if (!event) return NO;
+    NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
+    return [self pointIsCovered:point];
+}
+
+- (NSView *)hitTest:(NSPoint)point {
+    if ([self pointIsCovered:point]) return nil;
+    return [super hitTest:point];
+}
+
+- (void)mouseEntered:(NSEvent *)event { if (![self eventIsCovered:event]) [super mouseEntered:event]; }
+- (void)mouseExited:(NSEvent *)event { if (![self eventIsCovered:event]) [super mouseExited:event]; }
+- (void)mouseMoved:(NSEvent *)event { if (![self eventIsCovered:event]) [super mouseMoved:event]; }
+- (void)mouseDown:(NSEvent *)event { if (![self eventIsCovered:event]) [super mouseDown:event]; }
+- (void)mouseUp:(NSEvent *)event { if (![self eventIsCovered:event]) [super mouseUp:event]; }
+- (void)mouseDragged:(NSEvent *)event { if (![self eventIsCovered:event]) [super mouseDragged:event]; }
+- (void)rightMouseDown:(NSEvent *)event { if (![self eventIsCovered:event]) [super rightMouseDown:event]; }
+- (void)rightMouseUp:(NSEvent *)event { if (![self eventIsCovered:event]) [super rightMouseUp:event]; }
+
+@end
+
 @implementation ZeroNativeBridgeScriptHandler
 
 - (void)userContentController:(WKUserContentController *)userContentController didReceiveScriptMessage:(WKScriptMessage *)message {
     (void)userContentController;
-    [self.host receiveBridgeMessage:message windowId:self.windowId];
+    [self.host receiveBridgeMessage:message windowId:self.windowId webViewLabel:self.webViewLabel ?: @"main"];
 }
 
 @end
@@ -218,6 +281,8 @@ static BOOL ZeroNativePolicyListMatches(NSArray<NSString *> *values, NSURL *url)
     self.bridgeScriptHandlers = [[NSMutableDictionary alloc] init];
     self.assetSchemeHandlers = [[NSMutableDictionary alloc] init];
     self.windowLabels = [[NSMutableDictionary alloc] init];
+    self.childWebViews = [[NSMutableDictionary alloc] init];
+    self.bridgeEnabledChildWebViewKeys = [[NSMutableSet alloc] init];
     self.allowedNavigationOrigins = @[ @"zero://app", @"zero://inline" ];
     self.allowedExternalURLs = @[];
     self.externalLinkAction = 0;
@@ -258,6 +323,7 @@ static BOOL ZeroNativePolicyListMatches(NSArray<NSString *> *values, NSURL *url)
     ZeroNativeBridgeScriptHandler *bridgeScriptHandler = [[ZeroNativeBridgeScriptHandler alloc] init];
     bridgeScriptHandler.host = self;
     bridgeScriptHandler.windowId = windowId;
+    bridgeScriptHandler.webViewLabel = @"main";
     [userContentController addScriptMessageHandler:bridgeScriptHandler name:@"zeroNativeBridge"];
     WKUserScript *bridgeScript = [[WKUserScript alloc] initWithSource:ZeroNativeAppKitBridgeScript()
                                                         injectionTime:WKUserScriptInjectionTimeAtDocumentStart
@@ -267,13 +333,20 @@ static BOOL ZeroNativePolicyListMatches(NSArray<NSString *> *values, NSURL *url)
     if ([configuration.preferences respondsToSelector:NSSelectorFromString(@"setDeveloperExtrasEnabled:")]) {
         [configuration.preferences setValue:@YES forKey:@"developerExtrasEnabled"];
     }
-    WKWebView *webView = [[WKWebView alloc] initWithFrame:rect configuration:configuration];
+    NSView *container = [[NSView alloc] initWithFrame:rect];
+    container.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    WKWebView *webView = [[ZeroNativeWebView alloc] initWithFrame:container.bounds configuration:configuration];
+    webView.wantsLayer = YES;
+    webView.layer.zPosition = 0;
+    webView.layer.backgroundColor = NSColor.clearColor.CGColor;
+    [webView setValue:@NO forKey:@"drawsBackground"];
     if ([webView respondsToSelector:NSSelectorFromString(@"setInspectable:")]) {
         [webView setValue:@YES forKey:@"inspectable"];
     }
     webView.navigationDelegate = self;
     webView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-    window.contentView = webView;
+    [container addSubview:webView positioned:NSWindowAbove relativeTo:nil];
+    window.contentView = container;
 
     ZeroNativeWindowDelegate *delegate = [[ZeroNativeWindowDelegate alloc] init];
     delegate.host = self;
@@ -301,6 +374,11 @@ static BOOL ZeroNativePolicyListMatches(NSArray<NSString *> *values, NSURL *url)
 }
 
 - (void)dealloc {
+    if (self.shortcutEventMonitor) {
+        [NSEvent removeMonitor:self.shortcutEventMonitor];
+        self.shortcutEventMonitor = nil;
+    }
+    [self removeAllChildBridgeHandlers];
     for (WKWebView *webView in self.webViews.allValues) {
         [webView.configuration.userContentController removeScriptMessageHandlerForName:@"zeroNativeBridge"];
     }
@@ -325,8 +403,310 @@ static BOOL ZeroNativePolicyListMatches(NSArray<NSString *> *values, NSURL *url)
     return self.webViews[@(windowId)] ?: self.webView;
 }
 
+- (WKWebView *)mainWebViewForWindow:(NSWindow *)window {
+    if (!window) return self.webView;
+    for (NSNumber *key in self.windows) {
+        if (self.windows[key] == window) return self.webViews[key] ?: self.webView;
+    }
+    return self.webView;
+}
+
 - (ZeroNativeAssetSchemeHandler *)assetHandlerForWindowId:(uint64_t)windowId {
     return self.assetSchemeHandlers[@(windowId)] ?: self.assetSchemeHandler;
+}
+
+- (NSString *)webViewKeyForWindow:(uint64_t)windowId label:(NSString *)label {
+    return [NSString stringWithFormat:@"%llu:%@", windowId, label ?: @""];
+}
+
+- (NSRect)webViewFrameForWindow:(NSWindow *)window x:(double)x y:(double)y width:(double)width height:(double)height {
+    NSView *contentView = window.contentView;
+    CGFloat nativeY = contentView.isFlipped ? y : contentView.bounds.size.height - y - height;
+    return NSMakeRect(x, nativeY, width, height);
+}
+
+- (BOOL)createWebViewInWindow:(uint64_t)windowId label:(NSString *)label url:(NSString *)url x:(double)x y:(double)y width:(double)width height:(double)height layer:(NSInteger)layer transparent:(BOOL)transparent bridgeEnabled:(BOOL)bridgeEnabled {
+    if (label.length == 0 || url.length == 0 || width <= 0 || height <= 0 || x < 0 || y < 0) return NO;
+    NSWindow *window = self.windows[@(windowId)] ?: (windowId == 1 ? self.window : nil);
+    if (!window || !window.contentView) return NO;
+    NSURL *targetURL = [NSURL URLWithString:url];
+    if (!targetURL) return NO;
+    if (![self allowsNavigationURL:targetURL]) return NO;
+    if (self.childWebViews.count >= ZeroNativeMaxChildWebViews) return NO;
+
+    NSString *key = [self webViewKeyForWindow:windowId label:label];
+    WKWebView *existing = self.childWebViews[key];
+    if (existing) return NO;
+
+    WKWebViewConfiguration *configuration = [[WKWebViewConfiguration alloc] init];
+    if (bridgeEnabled) {
+        WKUserContentController *controller = [[WKUserContentController alloc] init];
+        ZeroNativeBridgeScriptHandler *handler = [[ZeroNativeBridgeScriptHandler alloc] init];
+        handler.host = self;
+        handler.windowId = windowId;
+        handler.webViewLabel = label;
+        [controller addScriptMessageHandler:handler name:@"zeroNativeBridge"];
+        [controller addUserScript:[[WKUserScript alloc] initWithSource:ZeroNativeAppKitBridgeScript() injectionTime:WKUserScriptInjectionTimeAtDocumentStart forMainFrameOnly:YES]];
+        configuration.userContentController = controller;
+    }
+    if ([configuration.preferences respondsToSelector:NSSelectorFromString(@"setDeveloperExtrasEnabled:")]) {
+        [configuration.preferences setValue:@YES forKey:@"developerExtrasEnabled"];
+    }
+
+    WKWebView *webview = [[ZeroNativeWebView alloc] initWithFrame:[self webViewFrameForWindow:window x:x y:y width:width height:height] configuration:configuration];
+    webview.wantsLayer = YES;
+    webview.layer.zPosition = layer;
+    if (transparent) {
+        webview.layer.backgroundColor = NSColor.clearColor.CGColor;
+        [webview setValue:@NO forKey:@"drawsBackground"];
+    }
+    if ([webview respondsToSelector:NSSelectorFromString(@"setInspectable:")]) {
+        [webview setValue:@YES forKey:@"inspectable"];
+    }
+    webview.navigationDelegate = self;
+    webview.autoresizingMask = NSViewNotSizable;
+    [window.contentView addSubview:webview positioned:NSWindowAbove relativeTo:nil];
+    [webview loadRequest:[NSURLRequest requestWithURL:targetURL]];
+    self.childWebViews[key] = webview;
+    if (bridgeEnabled) [self.bridgeEnabledChildWebViewKeys addObject:key];
+    [self reorderWebViewsInWindow:windowId];
+    [self scheduleBridgeFrames];
+    return YES;
+}
+
+- (BOOL)setWebViewFrameInWindow:(uint64_t)windowId label:(NSString *)label x:(double)x y:(double)y width:(double)width height:(double)height {
+    if (label.length == 0 || width <= 0 || height <= 0 || x < 0 || y < 0) return NO;
+    NSWindow *window = self.windows[@(windowId)] ?: (windowId == 1 ? self.window : nil);
+    if ([label isEqualToString:@"main"]) {
+        WKWebView *webView = [self webViewForWindowId:windowId];
+        if (!window || !webView) return NO;
+        webView.autoresizingMask = NSViewNotSizable;
+        webView.frame = [self webViewFrameForWindow:window x:x y:y width:width height:height];
+        [self reorderWebViewsInWindow:windowId];
+        [self scheduleBridgeFrames];
+        return YES;
+    }
+    WKWebView *webview = self.childWebViews[[self webViewKeyForWindow:windowId label:label]];
+    if (!window || !webview) return NO;
+    webview.frame = [self webViewFrameForWindow:window x:x y:y width:width height:height];
+    [self reorderWebViewsInWindow:windowId];
+    [self scheduleBridgeFrames];
+    return YES;
+}
+
+- (BOOL)navigateWebViewInWindow:(uint64_t)windowId label:(NSString *)label url:(NSString *)url {
+    if (label.length == 0 || url.length == 0) return NO;
+    NSURL *targetURL = [NSURL URLWithString:url ?: @""];
+    if ([label isEqualToString:@"main"]) {
+        WKWebView *webView = [self webViewForWindowId:windowId];
+        if (!webView || !targetURL) return NO;
+        if (![self allowsNavigationURL:targetURL]) return NO;
+        [webView loadRequest:[NSURLRequest requestWithURL:targetURL]];
+        [self scheduleBridgeFrames];
+        return YES;
+    }
+    WKWebView *webview = self.childWebViews[[self webViewKeyForWindow:windowId label:label]];
+    if (!webview || !targetURL) return NO;
+    if (![self allowsNavigationURL:targetURL]) return NO;
+    [webview loadRequest:[NSURLRequest requestWithURL:targetURL]];
+    [self scheduleBridgeFrames];
+    return YES;
+}
+
+- (BOOL)setWebViewZoomInWindow:(uint64_t)windowId label:(NSString *)label zoom:(double)zoom {
+    if (label.length == 0 || zoom < 0.25 || zoom > 5.0) return NO;
+    if ([label isEqualToString:@"main"]) {
+        WKWebView *webView = [self webViewForWindowId:windowId];
+        if (!webView) return NO;
+        webView.pageZoom = zoom;
+        return YES;
+    }
+    WKWebView *webview = self.childWebViews[[self webViewKeyForWindow:windowId label:label]];
+    if (!webview) return NO;
+    webview.pageZoom = zoom;
+    return YES;
+}
+
+- (BOOL)setWebViewLayerInWindow:(uint64_t)windowId label:(NSString *)label layer:(NSInteger)layer {
+    if (label.length == 0) return NO;
+    if ([label isEqualToString:@"main"]) {
+        WKWebView *webView = [self webViewForWindowId:windowId];
+        if (!webView) return NO;
+        webView.wantsLayer = YES;
+        webView.layer.zPosition = layer;
+        [self reorderWebViewsInWindow:windowId];
+        return YES;
+    }
+    WKWebView *webview = self.childWebViews[[self webViewKeyForWindow:windowId label:label]];
+    if (!webview) return NO;
+    webview.wantsLayer = YES;
+    webview.layer.zPosition = layer;
+    [self reorderWebViewsInWindow:windowId];
+    return YES;
+}
+
+- (BOOL)closeWebViewInWindow:(uint64_t)windowId label:(NSString *)label {
+    NSString *key = [self webViewKeyForWindow:windowId label:label];
+    WKWebView *webview = self.childWebViews[key];
+    if (!webview) return NO;
+    [self removeBridgeHandlerForChildWebView:webview key:key];
+    [webview removeFromSuperview];
+    [self.childWebViews removeObjectForKey:key];
+    [self reorderWebViewsInWindow:windowId];
+    [self scheduleBridgeFrames];
+    return YES;
+}
+
+- (void)closeWebViewsInWindow:(uint64_t)windowId {
+    NSString *prefix = [NSString stringWithFormat:@"%llu:", windowId];
+    NSArray<NSString *> *keys = [self.childWebViews.allKeys copy];
+    for (NSString *key in keys) {
+        if (![key hasPrefix:prefix]) continue;
+        WKWebView *webview = self.childWebViews[key];
+        [self removeBridgeHandlerForChildWebView:webview key:key];
+        [webview removeFromSuperview];
+        [self.childWebViews removeObjectForKey:key];
+    }
+    [self reorderWebViewsInWindow:windowId];
+}
+
+- (void)reorderWebViewsInWindow:(uint64_t)windowId {
+    NSWindow *window = self.windows[@(windowId)] ?: (windowId == 1 ? self.window : nil);
+    NSView *contentView = window.contentView;
+    if (!contentView) return;
+
+    NSMutableArray<NSView *> *views = [[NSMutableArray alloc] init];
+    WKWebView *mainWebView = self.webViews[@(windowId)];
+    if (mainWebView && mainWebView.superview == contentView) {
+        [views addObject:mainWebView];
+    }
+
+    NSString *prefix = [NSString stringWithFormat:@"%llu:", windowId];
+    for (NSString *key in self.childWebViews) {
+        if (![key hasPrefix:prefix]) continue;
+        WKWebView *view = self.childWebViews[key];
+        if (view && view.superview == contentView) {
+            [views addObject:view];
+        }
+    }
+
+    [views sortUsingComparator:^NSComparisonResult(NSView *first, NSView *second) {
+        CGFloat firstLayer = first.layer.zPosition;
+        CGFloat secondLayer = second.layer.zPosition;
+        if (firstLayer < secondLayer) return NSOrderedAscending;
+        if (firstLayer > secondLayer) return NSOrderedDescending;
+        NSUInteger firstIndex = [contentView.subviews indexOfObjectIdenticalTo:first];
+        NSUInteger secondIndex = [contentView.subviews indexOfObjectIdenticalTo:second];
+        if (firstIndex < secondIndex) return NSOrderedAscending;
+        if (firstIndex > secondIndex) return NSOrderedDescending;
+        return NSOrderedSame;
+    }];
+
+    NSView *previous = nil;
+    for (NSView *view in views) {
+        [contentView addSubview:view positioned:NSWindowAbove relativeTo:previous];
+        previous = view;
+    }
+    [self updateCoveredMouseRectsInWindow:windowId];
+}
+
+- (void)updateCoveredMouseRectsInWindow:(uint64_t)windowId {
+    NSWindow *window = self.windows[@(windowId)] ?: (windowId == 1 ? self.window : nil);
+    NSView *contentView = window.contentView;
+    if (!contentView) return;
+
+    NSMutableArray<NSView *> *views = [[NSMutableArray alloc] init];
+    WKWebView *mainWebView = self.webViews[@(windowId)];
+    if ([mainWebView isKindOfClass:[ZeroNativeWebView class]] && mainWebView.superview == contentView) {
+        [views addObject:mainWebView];
+    }
+
+    NSString *prefix = [NSString stringWithFormat:@"%llu:", windowId];
+    for (NSString *key in self.childWebViews) {
+        if (![key hasPrefix:prefix]) continue;
+        WKWebView *webView = self.childWebViews[key];
+        if ([webView isKindOfClass:[ZeroNativeWebView class]] && webView.superview == contentView) {
+            [views addObject:webView];
+        }
+    }
+
+    [views sortUsingComparator:^NSComparisonResult(NSView *first, NSView *second) {
+        CGFloat firstLayer = first.layer.zPosition;
+        CGFloat secondLayer = second.layer.zPosition;
+        if (firstLayer < secondLayer) return NSOrderedAscending;
+        if (firstLayer > secondLayer) return NSOrderedDescending;
+        NSUInteger firstIndex = [contentView.subviews indexOfObjectIdenticalTo:first];
+        NSUInteger secondIndex = [contentView.subviews indexOfObjectIdenticalTo:second];
+        if (firstIndex < secondIndex) return NSOrderedAscending;
+        if (firstIndex > secondIndex) return NSOrderedDescending;
+        return NSOrderedSame;
+    }];
+
+    for (NSUInteger index = 0; index < views.count; index++) {
+        ZeroNativeWebView *webView = (ZeroNativeWebView *)views[index];
+        NSMutableArray<NSValue *> *coveredRects = [[NSMutableArray alloc] init];
+        for (NSUInteger coverIndex = index + 1; coverIndex < views.count; coverIndex++) {
+            NSView *coveringView = views[coverIndex];
+            NSRect intersection = NSIntersectionRect(webView.frame, coveringView.frame);
+            if (NSIsEmptyRect(intersection)) continue;
+            [coveredRects addObject:[NSValue valueWithRect:[webView convertRect:intersection fromView:contentView]]];
+        }
+        webView.coveredMouseRects = coveredRects;
+        [self applyCoveredMouseRects:coveredRects toWebView:webView];
+    }
+}
+
+- (void)applyCoveredMouseRects:(NSArray<NSValue *> *)rects toWebView:(WKWebView *)webView {
+    NSMutableString *rectsJson = [[NSMutableString alloc] initWithString:@"["];
+    for (NSUInteger index = 0; index < rects.count; index++) {
+        NSRect rect = rects[index].rectValue;
+        CGFloat x = rect.origin.x;
+        CGFloat y = webView.isFlipped ? rect.origin.y : webView.bounds.size.height - rect.origin.y - rect.size.height;
+        if (index > 0) [rectsJson appendString:@","];
+        [rectsJson appendFormat:@"{\"x\":%.3f,\"y\":%.3f,\"width\":%.3f,\"height\":%.3f}", x, y, rect.size.width, rect.size.height];
+    }
+    [rectsJson appendString:@"]"];
+
+    // WKWebView can keep CSS hover active via internal tracking even after
+    // AppKit hit-testing excludes the view, so mirror native coverage into the
+    // document as transparent fixed-position event covers.
+    NSString *script = [NSString stringWithFormat:
+        @"(function(rects){"
+         "var id='__zero_native_covered_mouse_rects__';"
+         "var root=document.getElementById(id);"
+         "if(!rects.length){if(root)root.remove();return;}"
+         "var parent=document.documentElement||document.body;"
+         "if(!parent)return;"
+         "if(!root){"
+           "root=document.createElement('div');"
+           "root.id=id;"
+           "root.style.cssText='position:fixed;left:0;top:0;width:0;height:0;z-index:2147483647;pointer-events:none;';"
+           "parent.appendChild(root);"
+         "}"
+         "root.textContent='';"
+         "rects.forEach(function(r){"
+           "var cover=document.createElement('div');"
+           "cover.style.cssText='position:fixed;left:'+r.x+'px;top:'+r.y+'px;width:'+r.width+'px;height:'+r.height+'px;background:transparent;z-index:2147483647;pointer-events:auto;';"
+           "['pointerover','pointerenter','pointermove','pointerout','pointerleave','pointerdown','pointerup','pointercancel','mouseover','mouseenter','mousemove','mouseout','mouseleave','mousedown','mouseup','click','contextmenu'].forEach(function(type){"
+             "cover.addEventListener(type,function(event){event.preventDefault();event.stopPropagation();},true);"
+           "});"
+           "root.appendChild(cover);"
+         "});"
+        "})(%@);", rectsJson];
+    [webView evaluateJavaScript:script completionHandler:nil];
+}
+
+- (void)removeBridgeHandlerForChildWebView:(WKWebView *)webView key:(NSString *)key {
+    if (!webView || key.length == 0 || ![self.bridgeEnabledChildWebViewKeys containsObject:key]) return;
+    [webView.configuration.userContentController removeScriptMessageHandlerForName:@"zeroNativeBridge"];
+    [self.bridgeEnabledChildWebViewKeys removeObject:key];
+}
+
+- (void)removeAllChildBridgeHandlers {
+    NSArray<NSString *> *keys = [self.bridgeEnabledChildWebViewKeys.allObjects copy];
+    for (NSString *key in keys) {
+        [self removeBridgeHandlerForChildWebView:self.childWebViews[key] key:key];
+    }
 }
 
 static NSRect constrainFrame(NSRect frame) {
@@ -374,6 +754,14 @@ static NSString *ZeroNativeAppKitBridgeScript(void) {
         "});"
         "}"
         "function selector(value){return typeof value==='number'?{id:value}:{label:String(value)};}"
+        "function ensureString(value,name){if(typeof value!=='string'||value.length===0){throw new TypeError(name+' must be a non-empty string');}return value;}"
+        "function ensureNumber(value,name){if(typeof value!=='number'||!isFinite(value)){throw new TypeError(name+' must be a finite number');}return value;}"
+        "function validateWebViewSelector(options){if(options.label!=null){ensureString(options.label,'label');}if(options.windowId!=null&&(typeof options.windowId!=='number'||!isFinite(options.windowId)||options.windowId<0||Math.floor(options.windowId)!==options.windowId)){throw new TypeError('windowId must be a non-negative integer');}}"
+        "function framePayload(options){options=options||{};validateWebViewSelector(options);var frame=options.frame||options;return {label:options.label,windowId:options.windowId,url:options.url,frame:{x:frame.x==null?0:ensureNumber(frame.x,'frame.x'),y:frame.y==null?0:ensureNumber(frame.y,'frame.y'),width:ensureNumber(frame.width,'frame.width'),height:ensureNumber(frame.height,'frame.height')}};}"
+        "function createPayload(options){options=options||{};ensureString(options.url,'url');var payload=framePayload(options);if(options.layer!=null){payload.layer=ensureNumber(options.layer,'layer');}if(options.transparent!=null){payload.transparent=!!options.transparent;}if(options.bridge!=null){payload.bridge=!!options.bridge;}return payload;}"
+        "function navigatePayload(options){options=options||{};validateWebViewSelector(options);ensureString(options.url,'url');return {label:options.label,windowId:options.windowId,url:options.url};}"
+        "function closePayload(options){options=options||{};validateWebViewSelector(options);return {label:options.label,windowId:options.windowId};}"
+        "function webviewHandle(info){return Object.freeze(Object.assign({},info,{setFrame:function(frame){return webviews.setFrame({label:info.label,windowId:info.windowId,frame:frame});},navigate:function(url){return webviews.navigate({label:info.label,windowId:info.windowId,url:url});},setZoom:function(zoom){return webviews.setZoom({label:info.label,windowId:info.windowId,zoom:zoom});},setLayer:function(layer){return webviews.setLayer({label:info.label,windowId:info.windowId,layer:layer});},close:function(){return webviews.close({label:info.label,windowId:info.windowId});}}));}"
         "function on(name,callback){if(typeof callback!=='function'){throw new TypeError('callback must be a function');}var set=listeners.get(name);if(!set){set=new Set();listeners.set(name,set);}set.add(callback);return function(){off(name,callback);};}"
         "function off(name,callback){var set=listeners.get(name);if(set){set.delete(callback);if(set.size===0){listeners.delete(name);}}}"
         "function emit(name,detail){var set=listeners.get(name);if(set){Array.from(set).forEach(function(callback){callback(detail);});}window.dispatchEvent(new CustomEvent('zero-native:'+name,{detail:detail}));}"
@@ -388,7 +776,18 @@ static NSString *ZeroNativeAppKitBridgeScript(void) {
         "saveFile:function(options){return invoke('zero-native.dialog.saveFile',options||{});},"
         "showMessage:function(options){return invoke('zero-native.dialog.showMessage',options||{});}"
         "});"
-        "Object.defineProperty(window,'zero',{value:Object.freeze({invoke:invoke,on:on,off:off,windows:windows,dialogs:dialogs,_complete:complete,_emit:emit}),configurable:false});"
+        "function zoomPayload(options){options=options||{};validateWebViewSelector(options);return {label:options.label,windowId:options.windowId,zoom:ensureNumber(options.zoom,'zoom')};}"
+        "function layerPayload(options){options=options||{};validateWebViewSelector(options);return {label:options.label,windowId:options.windowId,layer:ensureNumber(options.layer,'layer')};}"
+        "var webviews=Object.freeze({"
+        "create:function(options){return invoke('zero-native.webview.create',createPayload(options)).then(webviewHandle);},"
+        "list:function(){return invoke('zero-native.webview.list',{});},"
+        "setFrame:function(options){return invoke('zero-native.webview.setFrame',framePayload(options));},"
+        "navigate:function(options){return invoke('zero-native.webview.navigate',navigatePayload(options));},"
+        "setZoom:function(options){return invoke('zero-native.webview.setZoom',zoomPayload(options));},"
+        "setLayer:function(options){return invoke('zero-native.webview.setLayer',layerPayload(options));},"
+        "close:function(options){return invoke('zero-native.webview.close',closePayload(options));}"
+        "});"
+        "Object.defineProperty(window,'zero',{value:Object.freeze({invoke:invoke,on:on,off:off,windows:windows,dialogs:dialogs,webviews:webviews,_complete:complete,_emit:emit}),configurable:false});"
         "})();";
 }
 
@@ -535,6 +934,14 @@ static NSURL *ZeroNativeAssetEntryURL(NSString *origin, NSString *entryPath) {
 
     [self.window makeKeyAndOrderFront:nil];
     [NSApp activate];
+    if (!self.shortcutEventMonitor) {
+        __weak ZeroNativeAppKitHost *weakSelf = self;
+        self.shortcutEventMonitor = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown handler:^NSEvent *(NSEvent *event) {
+            ZeroNativeAppKitHost *strongSelf = weakSelf;
+            if (strongSelf && [strongSelf handleShortcutEvent:event]) return nil;
+            return event;
+        }];
+    }
 
     [self emitEvent:(zero_native_appkit_event_t){ .kind = ZERO_NATIVE_APPKIT_EVENT_START }];
     [self emitResize];
@@ -547,6 +954,10 @@ static NSURL *ZeroNativeAssetEntryURL(NSString *origin, NSString *entryPath) {
 - (void)stop {
     [self.timer invalidate];
     self.timer = nil;
+    if (self.shortcutEventMonitor) {
+        [NSEvent removeMonitor:self.shortcutEventMonitor];
+        self.shortcutEventMonitor = nil;
+    }
     [NSApp stop:nil];
     NSEvent *event = [NSEvent otherEventWithType:NSEventTypeApplicationDefined
                                         location:NSZeroPoint
@@ -571,9 +982,8 @@ static NSURL *ZeroNativeAssetEntryURL(NSString *origin, NSString *entryPath) {
 }
 
 - (void)emitResizeForWindowId:(uint64_t)windowId {
-    WKWebView *webView = [self webViewForWindowId:windowId];
     NSWindow *window = self.windows[@(windowId)] ?: self.window;
-    NSRect bounds = webView.bounds;
+    NSRect bounds = window.contentView.bounds;
     [self emitEvent:(zero_native_appkit_event_t){
         .kind = ZERO_NATIVE_APPKIT_EVENT_RESIZE,
         .window_id = windowId,
@@ -581,6 +991,17 @@ static NSURL *ZeroNativeAssetEntryURL(NSString *origin, NSString *entryPath) {
         .height = bounds.size.height,
         .scale = window.backingScaleFactor,
     }];
+}
+
+- (void)emitDeferredResizeForWindowId:(uint64_t)windowId {
+    __weak ZeroNativeAppKitHost *weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        ZeroNativeAppKitHost *strongSelf = weakSelf;
+        if (!strongSelf || !strongSelf.windows[@(windowId)]) return;
+        [strongSelf emitWindowFrameForWindowId:windowId open:YES];
+        [strongSelf emitResizeForWindowId:windowId];
+        [strongSelf scheduleFrame];
+    });
 }
 
 - (void)emitWindowFrame:(BOOL)open {
@@ -615,9 +1036,18 @@ static NSURL *ZeroNativeAssetEntryURL(NSString *origin, NSString *entryPath) {
                                                 repeats:NO];
 }
 
+- (void)scheduleBridgeFrames {
+    self.bridgeFrameKeepalive = 30;
+    [self scheduleFrame];
+}
+
 - (void)emitFrame {
     self.timer = nil;
     [self emitEvent:(zero_native_appkit_event_t){ .kind = ZERO_NATIVE_APPKIT_EVENT_FRAME }];
+    if (self.bridgeFrameKeepalive > 0) {
+        self.bridgeFrameKeepalive -= 1;
+        [self scheduleFrame];
+    }
 }
 
 - (void)emitShutdown {
@@ -671,11 +1101,57 @@ static NSURL *ZeroNativeAssetEntryURL(NSString *origin, NSString *entryPath) {
     return YES;
 }
 
+- (void)emitNavigationForWebView:(WKWebView *)webView url:(NSURL *)url {
+    if (!webView || !url) return;
+    uint64_t windowId = 1;
+    NSString *label = @"main";
+    for (NSNumber *key in self.webViews) {
+        if (self.webViews[key] != webView) continue;
+        windowId = key.unsignedLongLongValue;
+        label = @"main";
+        break;
+    }
+    for (NSString *key in self.childWebViews) {
+        if (self.childWebViews[key] != webView) continue;
+        NSRange separator = [key rangeOfString:@":"];
+        if (separator.location != NSNotFound) {
+            windowId = (uint64_t)[[key substringToIndex:separator.location] longLongValue];
+            label = [key substringFromIndex:separator.location + 1];
+        }
+        break;
+    }
+    if ([label isEqualToString:@"main"]) return;
+    NSDictionary *detail = @{ @"windowId": @(windowId), @"label": label, @"url": url.absoluteString ?: @"" };
+    NSData *data = [NSJSONSerialization dataWithJSONObject:detail options:0 error:nil];
+    if (!data) return;
+    NSString *json = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    [self emitEventNamed:@"webview:navigate" detailJSON:json ?: @"{}" windowId:windowId];
+}
+
+- (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation {
+    (void)navigation;
+    for (NSNumber *key in self.webViews) {
+        if (self.webViews[key] == webView) {
+            [self updateCoveredMouseRectsInWindow:key.unsignedLongLongValue];
+            return;
+        }
+    }
+    for (NSString *key in self.childWebViews) {
+        if (self.childWebViews[key] != webView) continue;
+        NSRange separator = [key rangeOfString:@":"];
+        if (separator.location != NSNotFound) {
+            uint64_t windowId = (uint64_t)[[key substringToIndex:separator.location] longLongValue];
+            [self updateCoveredMouseRectsInWindow:windowId];
+        }
+        return;
+    }
+}
+
 - (void)webView:(WKWebView *)webView decidePolicyForNavigationAction:(WKNavigationAction *)navigationAction decisionHandler:(void (^)(WKNavigationActionPolicy))decisionHandler {
-    (void)webView;
     NSURL *url = navigationAction.request.URL;
     if (!navigationAction.targetFrame || navigationAction.targetFrame.isMainFrame) {
         if ([self allowsNavigationURL:url]) {
+            [self emitNavigationForWebView:webView url:url];
             decisionHandler(WKNavigationActionPolicyAllow);
             return;
         }
@@ -703,7 +1179,7 @@ static NSURL *ZeroNativeAssetEntryURL(NSString *origin, NSString *entryPath) {
     return [NSString stringWithFormat:@"%@://%@", securityOrigin.protocol, securityOrigin.host];
 }
 
-- (void)receiveBridgeMessage:(WKScriptMessage *)message windowId:(uint64_t)windowId {
+- (void)receiveBridgeMessage:(WKScriptMessage *)message windowId:(uint64_t)windowId webViewLabel:(NSString *)webViewLabel {
     if (!self.bridgeCallback) {
         return;
     }
@@ -724,18 +1200,32 @@ static NSURL *ZeroNativeAssetEntryURL(NSString *origin, NSString *entryPath) {
     NSString *origin = [self bridgeOriginForMessage:message];
     NSData *messageData = [messageString dataUsingEncoding:NSUTF8StringEncoding] ?: [NSData data];
     NSData *originData = [origin dataUsingEncoding:NSUTF8StringEncoding] ?: [NSData data];
-    self.bridgeCallback(self.bridgeContext, windowId, (const char *)messageData.bytes, messageData.length, (const char *)originData.bytes, originData.length);
+    NSData *labelData = [(webViewLabel.length > 0 ? webViewLabel : @"main") dataUsingEncoding:NSUTF8StringEncoding] ?: [NSData data];
+    self.bridgeCallback(self.bridgeContext, windowId, (const char *)labelData.bytes, labelData.length, (const char *)messageData.bytes, messageData.length, (const char *)originData.bytes, originData.length);
     [self scheduleFrame];
 }
 
 - (void)completeBridgeWithResponse:(NSString *)response {
-    [self completeBridgeWithResponse:response windowId:1];
+    [self completeBridgeWithResponse:response windowId:1 webViewLabel:@"main"];
 }
 
 - (void)completeBridgeWithResponse:(NSString *)response windowId:(uint64_t)windowId {
+    [self completeBridgeWithResponse:response windowId:windowId webViewLabel:@"main"];
+}
+
+- (void)completeBridgeWithResponse:(NSString *)response windowId:(uint64_t)windowId webViewLabel:(NSString *)webViewLabel {
     WKWebView *webView = [self webViewForWindowId:windowId];
     NSString *script = [NSString stringWithFormat:@"window.zero&&window.zero._complete(%@);", response.length > 0 ? response : @"{}"];
-    [webView evaluateJavaScript:script completionHandler:nil];
+    NSString *label = webViewLabel.length > 0 ? webViewLabel : @"main";
+    if ([label isEqualToString:@"main"]) {
+        if (!webView) return;
+        [webView evaluateJavaScript:script completionHandler:nil];
+    } else {
+        WKWebView *child = self.childWebViews[[self webViewKeyForWindow:windowId label:label]];
+        if (!child) return;
+        [child evaluateJavaScript:script completionHandler:nil];
+    }
+    [self scheduleBridgeFrames];
 }
 
 - (void)emitEventNamed:(NSString *)name detailJSON:(NSString *)detailJSON windowId:(uint64_t)windowId {
@@ -745,6 +1235,43 @@ static NSURL *ZeroNativeAssetEntryURL(NSString *origin, NSString *entryPath) {
     NSString *detail = detailJSON.length > 0 ? detailJSON : @"null";
     NSString *script = [NSString stringWithFormat:@"window.zero&&window.zero._emit(%@,%@);", nameJSON, detail];
     [webView evaluateJavaScript:script completionHandler:nil];
+    [self scheduleBridgeFrames];
+}
+
+- (BOOL)handleShortcutEvent:(NSEvent *)event {
+    if (event.type != NSEventTypeKeyDown) return NO;
+    NSEventModifierFlags flags = event.modifierFlags;
+    if ((flags & NSEventModifierFlagCommand) == 0) return NO;
+    if ((flags & (NSEventModifierFlagControl | NSEventModifierFlagOption)) != 0) return NO;
+
+    NSString *key = event.charactersIgnoringModifiers.lowercaseString ?: @"";
+    NSString *command = nil;
+    if ([key isEqualToString:@"="] || [key isEqualToString:@"+"]) {
+        command = @"zoom-in";
+    } else if ([key isEqualToString:@"-"]) {
+        command = @"zoom-out";
+    } else if ([key isEqualToString:@"0"]) {
+        command = @"zoom-reset";
+    } else if ([key isEqualToString:@"r"]) {
+        command = @"reload";
+    } else {
+        return NO;
+    }
+
+    uint64_t windowId = 1;
+    NSWindow *window = event.window ?: NSApp.keyWindow;
+    for (NSNumber *keyValue in self.windows) {
+        if (self.windows[keyValue] == window) {
+            windowId = keyValue.unsignedLongLongValue;
+            break;
+        }
+    }
+    NSDictionary *detail = @{ @"command": command };
+    NSData *data = [NSJSONSerialization dataWithJSONObject:detail options:0 error:nil];
+    if (!data) return NO;
+    NSString *json = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    [self emitEventNamed:@"shortcut" detailJSON:json ?: @"{}" windowId:windowId];
+    return YES;
 }
 
 - (void)showPreferences:(id)sender {
@@ -753,16 +1280,16 @@ static NSURL *ZeroNativeAssetEntryURL(NSString *origin, NSString *entryPath) {
 
 - (void)reload:(id)sender {
     (void)sender;
-    WKWebView *webView = (WKWebView *)NSApp.keyWindow.contentView;
-    if (![webView isKindOfClass:[WKWebView class]]) webView = self.webView;
+    WKWebView *webView = [self mainWebViewForWindow:NSApp.keyWindow];
+    if (!webView) return;
     [webView reload];
     [self scheduleFrame];
 }
 
 - (void)toggleWebInspector:(id)sender {
     (void)sender;
-    WKWebView *webView = (WKWebView *)NSApp.keyWindow.contentView;
-    if (![webView isKindOfClass:[WKWebView class]]) webView = self.webView;
+    WKWebView *webView = [self mainWebViewForWindow:NSApp.keyWindow];
+    if (!webView) return;
     SEL selector = NSSelectorFromString(@"_showInspector");
     if ([webView respondsToSelector:selector]) {
         ((void (*)(id, SEL))[webView methodForSelector:selector])(webView, selector);
@@ -880,6 +1407,13 @@ void zero_native_appkit_bridge_respond_window(zero_native_appkit_host_t *host, u
     [object completeBridgeWithResponse:responseString ?: @"{}" windowId:window_id];
 }
 
+void zero_native_appkit_bridge_respond_webview(zero_native_appkit_host_t *host, uint64_t window_id, const char *webview_label, size_t webview_label_len, const char *response, size_t response_len) {
+    ZeroNativeAppKitHost *object = (__bridge ZeroNativeAppKitHost *)host;
+    NSString *labelString = webview_label ? [[NSString alloc] initWithBytes:webview_label length:webview_label_len encoding:NSUTF8StringEncoding] : @"main";
+    NSString *responseString = response ? [[NSString alloc] initWithBytes:response length:response_len encoding:NSUTF8StringEncoding] : @"{}";
+    [object completeBridgeWithResponse:responseString ?: @"{}" windowId:window_id webViewLabel:labelString ?: @"main"];
+}
+
 void zero_native_appkit_emit_window_event(zero_native_appkit_host_t *host, uint64_t window_id, const char *name, size_t name_len, const char *detail_json, size_t detail_json_len) {
     ZeroNativeAppKitHost *object = (__bridge ZeroNativeAppKitHost *)host;
     NSString *nameString = name ? [[NSString alloc] initWithBytes:name length:name_len encoding:NSUTF8StringEncoding] : @"";
@@ -913,6 +1447,44 @@ int zero_native_appkit_close_window(zero_native_appkit_host_t *host, uint64_t wi
     if (!object.windows[@(window_id)]) return 0;
     [object closeWindowWithId:window_id];
     return 1;
+}
+
+int zero_native_appkit_create_webview(zero_native_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len, const char *url, size_t url_len, double x, double y, double width, double height, int layer, int transparent, int bridge_enabled) {
+    ZeroNativeAppKitHost *object = (__bridge ZeroNativeAppKitHost *)host;
+    NSString *labelString = label ? [[NSString alloc] initWithBytes:label length:label_len encoding:NSUTF8StringEncoding] : @"";
+    NSString *urlString = url ? [[NSString alloc] initWithBytes:url length:url_len encoding:NSUTF8StringEncoding] : @"";
+    return [object createWebViewInWindow:window_id label:labelString ?: @"" url:urlString ?: @"" x:x y:y width:width height:height layer:layer transparent:transparent != 0 bridgeEnabled:bridge_enabled != 0] ? 1 : 0;
+}
+
+int zero_native_appkit_set_webview_frame(zero_native_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len, double x, double y, double width, double height) {
+    ZeroNativeAppKitHost *object = (__bridge ZeroNativeAppKitHost *)host;
+    NSString *labelString = label ? [[NSString alloc] initWithBytes:label length:label_len encoding:NSUTF8StringEncoding] : @"";
+    return [object setWebViewFrameInWindow:window_id label:labelString ?: @"" x:x y:y width:width height:height] ? 1 : 0;
+}
+
+int zero_native_appkit_navigate_webview(zero_native_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len, const char *url, size_t url_len) {
+    ZeroNativeAppKitHost *object = (__bridge ZeroNativeAppKitHost *)host;
+    NSString *labelString = label ? [[NSString alloc] initWithBytes:label length:label_len encoding:NSUTF8StringEncoding] : @"";
+    NSString *urlString = url ? [[NSString alloc] initWithBytes:url length:url_len encoding:NSUTF8StringEncoding] : @"";
+    return [object navigateWebViewInWindow:window_id label:labelString ?: @"" url:urlString ?: @""] ? 1 : 0;
+}
+
+int zero_native_appkit_set_webview_zoom(zero_native_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len, double zoom) {
+    ZeroNativeAppKitHost *object = (__bridge ZeroNativeAppKitHost *)host;
+    NSString *labelString = label ? [[NSString alloc] initWithBytes:label length:label_len encoding:NSUTF8StringEncoding] : @"";
+    return [object setWebViewZoomInWindow:window_id label:labelString ?: @"" zoom:zoom] ? 1 : 0;
+}
+
+int zero_native_appkit_set_webview_layer(zero_native_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len, int layer) {
+    ZeroNativeAppKitHost *object = (__bridge ZeroNativeAppKitHost *)host;
+    NSString *labelString = label ? [[NSString alloc] initWithBytes:label length:label_len encoding:NSUTF8StringEncoding] : @"";
+    return [object setWebViewLayerInWindow:window_id label:labelString ?: @"" layer:layer] ? 1 : 0;
+}
+
+int zero_native_appkit_close_webview(zero_native_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len) {
+    ZeroNativeAppKitHost *object = (__bridge ZeroNativeAppKitHost *)host;
+    NSString *labelString = label ? [[NSString alloc] initWithBytes:label length:label_len encoding:NSUTF8StringEncoding] : @"";
+    return [object closeWebViewInWindow:window_id label:labelString ?: @""] ? 1 : 0;
 }
 
 size_t zero_native_appkit_clipboard_read(zero_native_appkit_host_t *host, char *buffer, size_t buffer_len) {

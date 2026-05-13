@@ -9,6 +9,9 @@ const platform = @import("../platform/root.zig");
 const security = @import("../security/root.zig");
 const window_state = @import("../window_state/root.zig");
 
+const max_async_bridge_responses: usize = 64;
+const max_bridge_origin_bytes: usize = 512;
+
 pub const LifecycleEvent = enum {
     start,
     frame,
@@ -96,6 +99,8 @@ pub const Runtime = struct {
     surface: platform.Surface,
     windows: [platform.max_windows]RuntimeWindow = undefined,
     window_count: usize = 0,
+    webviews: [platform.max_webviews]RuntimeWebView = undefined,
+    webview_count: usize = 0,
     next_window_id: platform.WindowId = 2,
     invalidated: bool = true,
     timestamp_ns: i128 = 0,
@@ -106,6 +111,7 @@ pub const Runtime = struct {
     last_invalidation_reason: InvalidationReason = .startup,
     last_diagnostics: FrameDiagnostics = .{},
     loaded_source: ?platform.WebViewSource = null,
+    async_bridge_responses: [max_async_bridge_responses]AsyncBridgeResponseSlot = [_]AsyncBridgeResponseSlot{.{}} ** max_async_bridge_responses,
     automation_windows: [automation.snapshot.max_windows]automation.snapshot.Window = undefined,
 
     pub fn init(options: Options) Runtime {
@@ -190,6 +196,7 @@ pub const Runtime = struct {
         try self.options.platform.services.closeWindow(window_id);
         self.windows[index].info.open = false;
         self.windows[index].info.focused = false;
+        self.removeWebViewsForWindow(window_id);
         self.invalidated = true;
     }
 
@@ -199,7 +206,7 @@ pub const Runtime = struct {
     }
 
     pub fn respondToBridge(self: *Runtime, source: bridge.Source, response: []const u8) anyerror!void {
-        try self.completeBridgeResponse(source.window_id, response);
+        try self.completeBridgeResponse(source.window_id, source.webview_label, response);
     }
 
     pub fn dispatchPlatformEvent(self: *Runtime, app: App, event_value: platform.Event) anyerror!void {
@@ -224,6 +231,14 @@ pub const Runtime = struct {
                     self.windows[index].info.frame.height = surface_value.size.height;
                     self.windows[index].info.scale_factor = surface_value.scale_factor;
                 }
+                var detail_buffer: [160]u8 = undefined;
+                var detail_writer = std.Io.Writer.fixed(&detail_buffer);
+                try detail_writer.print("{{\"width\":{d},\"height\":{d},\"scale\":{d}}}", .{
+                    surface_value.size.width,
+                    surface_value.size.height,
+                    surface_value.scale_factor,
+                });
+                self.emitWindowEvent(surface_value.id, "resize", detail_writer.buffered()) catch |err| try self.log("window.resize.emit_failed", @errorName(err), &.{});
                 self.invalidateFor(.surface_resize, geometry.RectF.fromSize(surface_value.size));
                 const fields = [_]trace.Field{
                     trace.float("width", surface_value.size.width),
@@ -349,6 +364,7 @@ pub const Runtime = struct {
             if (self.findWindowIndexById(window.id) == null) {
                 const runtime_index = try self.reserveWindow(window.id, window.label, window.resolvedTitle(app_info.app_name), source);
                 self.windows[runtime_index].info.frame = window.default_frame;
+                self.windows[runtime_index].main_frame = geometry.RectF.init(0, 0, window.default_frame.width, window.default_frame.height);
             }
             if (index > 0) {
                 _ = try self.options.platform.services.createWindow(window);
@@ -391,8 +407,8 @@ pub const Runtime = struct {
             self.invalidateFor(.command, null);
             return;
         }
-        const response = dispatcher.dispatch(message.bytes, .{ .origin = message.origin, .window_id = message.window_id }, &response_buffer);
-        try self.completeBridgeResponse(message.window_id, response);
+        const response = dispatcher.dispatch(message.bytes, .{ .origin = message.origin, .window_id = message.window_id, .webview_label = message.webview_label }, &response_buffer);
+        try self.completeBridgeResponse(message.window_id, message.webview_label, response);
         self.invalidateFor(.command, null);
         try self.log("bridge.dispatch", "bridge request handled", &.{
             trace.uint("request_bytes", message.bytes.len),
@@ -406,23 +422,44 @@ pub const Runtime = struct {
         if (!dispatcher.policy.allows(request.command, message.origin)) {
             var response_buffer: [bridge.max_response_bytes]u8 = undefined;
             const response = bridge.writeErrorResponse(&response_buffer, request.id, .permission_denied, "Bridge command is not permitted");
-            try self.completeBridgeResponse(message.window_id, response);
+            try self.completeBridgeResponse(message.window_id, message.webview_label, response);
             return true;
         }
+        const source_slot = self.reserveAsyncBridgeResponse(.{
+            .origin = message.origin,
+            .window_id = message.window_id,
+            .webview_label = message.webview_label,
+        }) catch |err| {
+            var response_buffer: [bridge.max_response_bytes]u8 = undefined;
+            const response = bridge.writeErrorResponse(&response_buffer, request.id, .internal_error, @errorName(err));
+            try self.completeBridgeResponse(message.window_id, message.webview_label, response);
+            return true;
+        };
+        errdefer source_slot.release();
         try handler.invoke_fn(handler.context, .{
             .request = request,
-            .source = .{ .origin = message.origin, .window_id = message.window_id },
+            .source = source_slot.source,
         }, .{
-            .context = self,
-            .source = .{ .origin = message.origin, .window_id = message.window_id },
+            .context = source_slot,
+            .source = source_slot.source,
             .respond_fn = asyncBridgeRespond,
         });
         return true;
     }
 
     fn asyncBridgeRespond(context: *anyopaque, source: bridge.Source, response: []const u8) anyerror!void {
-        const self: *Runtime = @ptrCast(@alignCast(context));
-        try self.respondToBridge(source, response);
+        _ = source;
+        const slot: *AsyncBridgeResponseSlot = @ptrCast(@alignCast(context));
+        try slot.respond(response);
+    }
+
+    fn reserveAsyncBridgeResponse(self: *Runtime, source: bridge.Source) !*AsyncBridgeResponseSlot {
+        for (&self.async_bridge_responses) |*slot| {
+            if (slot.in_use) continue;
+            try slot.init(self, source);
+            return slot;
+        }
+        return error.AsyncBridgeResponseLimitReached;
     }
 
     fn publishAutomation(self: *Runtime) anyerror!void {
@@ -441,7 +478,7 @@ pub const Runtime = struct {
                 self.invalidateFor(.command, null);
             },
             .bridge => {
-                try self.handleBridgeMessage(.{ .bytes = command.value, .origin = "zero://inline", .window_id = 1 });
+                try self.handleBridgeMessage(.{ .bytes = command.value, .origin = "zero://inline", .window_id = 1, .webview_label = "main" });
             },
             .wait => {},
         }
@@ -462,6 +499,10 @@ pub const Runtime = struct {
             .focused = self.window_count == 0,
         };
         self.windows[index].source = if (source) |source_value| try self.copySource(index, source_value) else null;
+        self.windows[index].main_frame = geometry.RectF.init(0, 0, self.windows[index].info.frame.width, self.windows[index].info.frame.height);
+        self.windows[index].main_frame_set = false;
+        self.windows[index].main_layer = 0;
+        self.windows[index].main_zoom = 1.0;
         self.window_count += 1;
         self.next_window_id = @max(self.next_window_id, id + 1);
         return index;
@@ -489,6 +530,9 @@ pub const Runtime = struct {
         self.windows[index].info.scale_factor = native_info.scale_factor;
         self.windows[index].info.open = native_info.open;
         self.windows[index].info.focused = native_info.focused;
+        if (!self.windows[index].main_frame_set) {
+            self.windows[index].main_frame = geometry.RectF.init(0, 0, native_info.frame.width, native_info.frame.height);
+        }
         if (native_info.focused) self.setFocusedIndex(index);
     }
 
@@ -502,6 +546,10 @@ pub const Runtime = struct {
         if (state.title.len > 0) info.title = try copyInto(&self.windows[index].title_storage, state.title);
         if (state.label.len > 0 and !std.mem.eql(u8, state.label, info.label)) info.label = try copyInto(&self.windows[index].label_storage, state.label);
         self.windows[index].info = info;
+        if (!self.windows[index].main_frame_set) {
+            self.windows[index].main_frame = geometry.RectF.init(0, 0, state.frame.width, state.frame.height);
+        }
+        if (!state.open) self.removeWebViewsForWindow(state.id);
         if (state.focused) self.setFocusedIndex(index);
     }
 
@@ -535,40 +583,48 @@ pub const Runtime = struct {
     fn handleBuiltinBridgeMessage(self: *Runtime, message: platform.BridgeMessage) anyerror!bool {
         const request = bridge.parseRequest(message.bytes) catch return false;
         const is_window = std.mem.startsWith(u8, request.command, "zero-native.window.");
+        const is_webview = std.mem.startsWith(u8, request.command, "zero-native.webview.");
         const is_dialog = std.mem.startsWith(u8, request.command, "zero-native.dialog.");
-        if (!is_window and !is_dialog) return false;
+        if (!is_window and !is_webview and !is_dialog) return false;
 
         var response_buffer: [bridge.max_response_bytes]u8 = undefined;
         var result_buffer: [bridge.max_result_bytes]u8 = undefined;
-        if (!self.allowsBuiltinBridgeCommand(request.command, message.origin, is_window)) {
-            const message_text = if (is_window) "Window API is not permitted" else "Dialog API is not permitted";
+        if (!self.allowsBuiltinBridgeCommand(request.command, message.origin, is_window or is_webview)) {
+            const message_text = if (is_webview)
+                "WebView API is not permitted"
+            else if (is_window)
+                "Window API is not permitted"
+            else
+                "Dialog API is not permitted";
             const result = bridge.writeErrorResponse(&response_buffer, request.id, .permission_denied, message_text);
-            try self.completeBridgeResponse(message.window_id, result);
+            try self.completeBridgeResponse(message.window_id, message.webview_label, result);
             self.invalidateFor(.command, null);
             return true;
         }
         const result = if (is_window)
             self.dispatchWindowBridgeCommand(request, &result_buffer, &response_buffer)
+        else if (is_webview)
+            self.dispatchWebViewBridgeCommand(request, message.window_id, &result_buffer, &response_buffer)
         else
             self.dispatchDialogBridgeCommand(request, &result_buffer, &response_buffer);
 
-        try self.completeBridgeResponse(message.window_id, result);
+        try self.completeBridgeResponse(message.window_id, message.webview_label, result);
         self.invalidateFor(.command, null);
         return true;
     }
 
-    fn completeBridgeResponse(self: *Runtime, window_id: platform.WindowId, response: []const u8) anyerror!void {
-        try self.options.platform.services.completeWindowBridge(window_id, response);
+    fn completeBridgeResponse(self: *Runtime, window_id: platform.WindowId, webview_label: []const u8, response: []const u8) anyerror!void {
+        try self.options.platform.services.completeWebViewBridge(window_id, webview_label, response);
         if (self.options.automation) |server| {
             server.publishBridgeResponse(response) catch |err| try self.log("automation.bridge_response_failed", @errorName(err), &.{});
         }
     }
 
-    fn allowsBuiltinBridgeCommand(self: *Runtime, command: []const u8, origin: []const u8, is_window: bool) bool {
+    fn allowsBuiltinBridgeCommand(self: *Runtime, command: []const u8, origin: []const u8, uses_window_permission: bool) bool {
         var policy = self.options.builtin_bridge;
         if (self.options.security.permissions.len > 0) policy.permissions = self.options.security.permissions;
         if (policy.enabled) return policy.allows(command, origin);
-        if (!is_window or !self.options.js_window_api) return false;
+        if (!uses_window_permission or !self.options.js_window_api) return false;
         if (!security.allowsOrigin(self.options.security.navigation.allowed_origins, origin)) return false;
         if (self.options.security.permissions.len == 0) return true;
         return security.hasPermission(self.options.security.permissions, security.permission_window);
@@ -585,6 +641,26 @@ pub const Runtime = struct {
             self.closeWindowFromJson(request.payload, result_buffer) catch |err| return bridge.writeErrorResponse(response_buffer, request.id, .internal_error, builtinBridgeErrorMessage(err))
         else
             return bridge.writeErrorResponse(response_buffer, request.id, .unknown_command, "Unknown window command");
+        return bridge.writeSuccessResponse(response_buffer, request.id, result);
+    }
+
+    fn dispatchWebViewBridgeCommand(self: *Runtime, request: bridge.Request, source_window_id: platform.WindowId, result_buffer: []u8, response_buffer: []u8) []const u8 {
+        const result = if (std.mem.eql(u8, request.command, "zero-native.webview.create"))
+            self.createWebViewFromJson(request.payload, source_window_id, result_buffer) catch |err| return bridge.writeErrorResponse(response_buffer, request.id, builtinBridgeErrorCode(err), builtinBridgeErrorMessage(err))
+        else if (std.mem.eql(u8, request.command, "zero-native.webview.list"))
+            self.writeWebViewListJson(source_window_id, result_buffer) catch |err| return bridge.writeErrorResponse(response_buffer, request.id, builtinBridgeErrorCode(err), builtinBridgeErrorMessage(err))
+        else if (std.mem.eql(u8, request.command, "zero-native.webview.setFrame"))
+            self.setWebViewFrameFromJson(request.payload, source_window_id, result_buffer) catch |err| return bridge.writeErrorResponse(response_buffer, request.id, builtinBridgeErrorCode(err), builtinBridgeErrorMessage(err))
+        else if (std.mem.eql(u8, request.command, "zero-native.webview.navigate"))
+            self.navigateWebViewFromJson(request.payload, source_window_id, result_buffer) catch |err| return bridge.writeErrorResponse(response_buffer, request.id, builtinBridgeErrorCode(err), builtinBridgeErrorMessage(err))
+        else if (std.mem.eql(u8, request.command, "zero-native.webview.setZoom"))
+            self.setWebViewZoomFromJson(request.payload, source_window_id, result_buffer) catch |err| return bridge.writeErrorResponse(response_buffer, request.id, builtinBridgeErrorCode(err), builtinBridgeErrorMessage(err))
+        else if (std.mem.eql(u8, request.command, "zero-native.webview.setLayer"))
+            self.setWebViewLayerFromJson(request.payload, source_window_id, result_buffer) catch |err| return bridge.writeErrorResponse(response_buffer, request.id, builtinBridgeErrorCode(err), builtinBridgeErrorMessage(err))
+        else if (std.mem.eql(u8, request.command, "zero-native.webview.close"))
+            self.closeWebViewFromJson(request.payload, source_window_id, result_buffer) catch |err| return bridge.writeErrorResponse(response_buffer, request.id, builtinBridgeErrorCode(err), builtinBridgeErrorMessage(err))
+        else
+            return bridge.writeErrorResponse(response_buffer, request.id, .unknown_command, "Unknown WebView command");
         return bridge.writeSuccessResponse(response_buffer, request.id, result);
     }
 
@@ -709,6 +785,237 @@ pub const Runtime = struct {
         return writeWindowJson(info, output);
     }
 
+    fn createWebViewFromJson(self: *Runtime, payload: []const u8, source_window_id: platform.WindowId, output: []u8) ![]const u8 {
+        var scratch: [platform.max_webview_label_bytes + platform.max_webview_url_bytes]u8 = undefined;
+        var storage = json.StringStorage.init(&scratch);
+        const label = jsonStringField(payload, "label", &storage) orelse "webview";
+        const url = jsonStringField(payload, "url", &storage) orelse return error.MissingWebViewUrl;
+        const window_id = try webViewWindowIdFromJson(payload, source_window_id);
+        const webview_frame = try webViewFrameFromJson(payload);
+        const layer = try webViewLayerFromJson(payload);
+        const transparent = jsonBoolField(payload, "transparent") orelse false;
+        const bridge_enabled = jsonBoolField(payload, "bridge") orelse false;
+        try self.validateWebViewParent(window_id);
+        try validateChildWebViewLabel(label);
+        try self.validateWebViewUrl(url);
+        if (self.findWebViewIndex(window_id, label) != null) return error.DuplicateWebViewLabel;
+        if (self.webview_count >= platform.max_webviews) return error.WebViewLimitReached;
+        try self.options.platform.services.createWebView(.{
+            .window_id = window_id,
+            .label = label,
+            .url = url,
+            .frame = webview_frame,
+            .layer = layer,
+            .transparent = transparent,
+            .bridge_enabled = bridge_enabled,
+        });
+        var reserved = false;
+        errdefer {
+            if (reserved) {
+                if (self.findWebViewIndex(window_id, label)) |index| self.removeWebViewAt(index);
+            }
+            self.options.platform.services.closeWebView(window_id, label) catch {};
+        }
+        try self.reserveWebView(window_id, label, url, webview_frame, layer, transparent, bridge_enabled);
+        reserved = true;
+        return writeWebViewJson(self.webviews[self.webview_count - 1], output);
+    }
+
+    fn setWebViewFrameFromJson(self: *Runtime, payload: []const u8, source_window_id: platform.WindowId, output: []u8) ![]const u8 {
+        var scratch: [platform.max_webview_label_bytes]u8 = undefined;
+        var storage = json.StringStorage.init(&scratch);
+        const label = jsonStringField(payload, "label", &storage) orelse "webview";
+        const window_id = try webViewWindowIdFromJson(payload, source_window_id);
+        const webview_frame = try webViewFrameFromJson(payload);
+        try self.validateWebViewParent(window_id);
+        try validateWebViewLabel(label);
+        if (isMainWebViewLabel(label)) {
+            const window_index = self.findWindowIndexById(window_id) orelse return error.WindowNotFound;
+            try self.options.platform.services.setWebViewFrame(window_id, label, webview_frame);
+            self.windows[window_index].main_frame = webview_frame;
+            self.windows[window_index].main_frame_set = true;
+            return writeWebViewJson(self.mainWebViewInfo(window_index), output);
+        }
+        const webview_index = self.findWebViewIndex(window_id, label) orelse return error.WebViewNotFound;
+        try self.options.platform.services.setWebViewFrame(window_id, label, webview_frame);
+        self.webviews[webview_index].frame = webview_frame;
+        return writeWebViewJson(self.webviews[webview_index], output);
+    }
+
+    fn navigateWebViewFromJson(self: *Runtime, payload: []const u8, source_window_id: platform.WindowId, output: []u8) ![]const u8 {
+        var scratch: [platform.max_webview_label_bytes + platform.max_webview_url_bytes]u8 = undefined;
+        var storage = json.StringStorage.init(&scratch);
+        const label = jsonStringField(payload, "label", &storage) orelse "webview";
+        const url = jsonStringField(payload, "url", &storage) orelse return error.MissingWebViewUrl;
+        const window_id = try webViewWindowIdFromJson(payload, source_window_id);
+        try self.validateWebViewParent(window_id);
+        try validateWebViewLabel(label);
+        try self.validateWebViewUrl(url);
+        if (isMainWebViewLabel(label)) return error.InvalidWebViewOptions;
+        const webview_index = self.findWebViewIndex(window_id, label) orelse return error.WebViewNotFound;
+        try self.options.platform.services.navigateWebView(window_id, label, url);
+        self.webviews[webview_index].url = try copyInto(&self.webviews[webview_index].url_storage, url);
+        return writeWebViewJson(self.webviews[webview_index], output);
+    }
+
+    fn setWebViewZoomFromJson(self: *Runtime, payload: []const u8, source_window_id: platform.WindowId, output: []u8) ![]const u8 {
+        var scratch: [platform.max_webview_label_bytes]u8 = undefined;
+        var storage = json.StringStorage.init(&scratch);
+        const label = jsonStringField(payload, "label", &storage) orelse "webview";
+        const zoom_f32 = jsonNumberField(payload, "zoom") orelse return error.InvalidWebViewOptions;
+        const zoom: f64 = @floatCast(zoom_f32);
+        if (zoom < 0.25 or zoom > 5.0) return error.InvalidWebViewOptions;
+        const window_id = try webViewWindowIdFromJson(payload, source_window_id);
+        try self.validateWebViewParent(window_id);
+        try validateWebViewLabel(label);
+        if (isMainWebViewLabel(label)) {
+            const window_index = self.findWindowIndexById(window_id) orelse return error.WindowNotFound;
+            try self.options.platform.services.setWebViewZoom(window_id, label, zoom);
+            self.windows[window_index].main_zoom = zoom;
+            return writeWebViewJson(self.mainWebViewInfo(window_index), output);
+        }
+        const webview_index = self.findWebViewIndex(window_id, label) orelse return error.WebViewNotFound;
+        try self.options.platform.services.setWebViewZoom(window_id, label, zoom);
+        self.webviews[webview_index].zoom = zoom;
+        return writeWebViewJson(self.webviews[webview_index], output);
+    }
+
+    fn setWebViewLayerFromJson(self: *Runtime, payload: []const u8, source_window_id: platform.WindowId, output: []u8) ![]const u8 {
+        var scratch: [platform.max_webview_label_bytes]u8 = undefined;
+        var storage = json.StringStorage.init(&scratch);
+        const label = jsonStringField(payload, "label", &storage) orelse "webview";
+        const window_id = try webViewWindowIdFromJson(payload, source_window_id);
+        try self.validateWebViewParent(window_id);
+        try validateWebViewLabel(label);
+        const layer = try webViewLayerFromJson(payload);
+        if (isMainWebViewLabel(label)) {
+            const window_index = self.findWindowIndexById(window_id) orelse return error.WindowNotFound;
+            try self.options.platform.services.setWebViewLayer(window_id, label, layer);
+            self.windows[window_index].main_layer = layer;
+            return writeWebViewJson(self.mainWebViewInfo(window_index), output);
+        }
+        const webview_index = self.findWebViewIndex(window_id, label) orelse return error.WebViewNotFound;
+        try self.options.platform.services.setWebViewLayer(window_id, label, layer);
+        self.webviews[webview_index].layer = layer;
+        return writeWebViewJson(self.webviews[webview_index], output);
+    }
+
+    fn closeWebViewFromJson(self: *Runtime, payload: []const u8, source_window_id: platform.WindowId, output: []u8) ![]const u8 {
+        var scratch: [platform.max_webview_label_bytes]u8 = undefined;
+        var storage = json.StringStorage.init(&scratch);
+        const label = jsonStringField(payload, "label", &storage) orelse "webview";
+        const window_id = try webViewWindowIdFromJson(payload, source_window_id);
+        try self.validateWebViewParent(window_id);
+        try validateWebViewLabel(label);
+        if (isMainWebViewLabel(label)) return error.InvalidWebViewOptions;
+        const webview_index = self.findWebViewIndex(window_id, label) orelse return error.WebViewNotFound;
+        var closed_info = self.webviews[webview_index];
+        closed_info.open = false;
+        const result = try writeWebViewJson(closed_info, output);
+        try self.options.platform.services.closeWebView(window_id, label);
+        self.removeWebViewAt(webview_index);
+        return result;
+    }
+
+    fn validateWebViewParent(self: *Runtime, window_id: platform.WindowId) !void {
+        const index = self.findWindowIndexById(window_id) orelse return error.WindowNotFound;
+        if (!self.windows[index].info.open) return error.WindowNotFound;
+    }
+
+    fn validateWebViewUrl(self: *Runtime, url: []const u8) !void {
+        if (url.len == 0) return error.MissingWebViewUrl;
+        if (url.len > platform.max_webview_url_bytes) return error.WebViewUrlTooLarge;
+        var origin_buffer: [512]u8 = undefined;
+        const origin = try webViewUrlOrigin(url, &origin_buffer);
+        if (!security.allowsOrigin(self.options.security.navigation.allowed_origins, origin)) return error.NavigationDenied;
+    }
+
+    fn writeWebViewListJson(self: *Runtime, source_window_id: platform.WindowId, output: []u8) ![]const u8 {
+        try self.validateWebViewParent(source_window_id);
+        var writer = std.Io.Writer.fixed(output);
+        try writer.writeByte('[');
+        const window_index = self.findWindowIndexById(source_window_id) orelse return error.WindowNotFound;
+        try writeWebViewJsonToWriter(self.mainWebViewInfo(window_index), &writer);
+        var written: usize = 1;
+        for (self.webviews[0..self.webview_count]) |webview| {
+            if (webview.window_id != source_window_id or !webview.open) continue;
+            if (written > 0) try writer.writeByte(',');
+            try writeWebViewJsonToWriter(webview, &writer);
+            written += 1;
+        }
+        try writer.writeByte(']');
+        return writer.buffered();
+    }
+
+    fn reserveWebView(self: *Runtime, window_id: platform.WindowId, label: []const u8, url: []const u8, webview_frame: geometry.RectF, layer: i32, transparent: bool, bridge_enabled: bool) !void {
+        const index = self.webview_count;
+        self.webviews[index] = .{
+            .window_id = window_id,
+            .frame = webview_frame,
+            .layer = layer,
+            .transparent = transparent,
+            .bridge_enabled = bridge_enabled,
+            .open = true,
+        };
+        self.webviews[index].label = try copyInto(&self.webviews[index].label_storage, label);
+        self.webviews[index].url = try copyInto(&self.webviews[index].url_storage, url);
+        self.webview_count += 1;
+    }
+
+    fn findWebViewIndex(self: *const Runtime, window_id: platform.WindowId, label: []const u8) ?usize {
+        for (self.webviews[0..self.webview_count], 0..) |webview, index| {
+            if (webview.open and webview.window_id == window_id and std.mem.eql(u8, webview.label, label)) return index;
+        }
+        return null;
+    }
+
+    fn removeWebViewAt(self: *Runtime, index: usize) void {
+        if (index >= self.webview_count) return;
+        var cursor = index;
+        while (cursor + 1 < self.webview_count) : (cursor += 1) {
+            const next = self.webviews[cursor + 1];
+            self.webviews[cursor] = .{
+                .window_id = next.window_id,
+                .frame = next.frame,
+                .layer = next.layer,
+                .zoom = next.zoom,
+                .transparent = next.transparent,
+                .bridge_enabled = next.bridge_enabled,
+                .open = next.open,
+            };
+            self.webviews[cursor].label = copyInto(&self.webviews[cursor].label_storage, next.label) catch unreachable;
+            self.webviews[cursor].url = copyInto(&self.webviews[cursor].url_storage, next.url) catch unreachable;
+        }
+        self.webview_count -= 1;
+    }
+
+    fn removeWebViewsForWindow(self: *Runtime, window_id: platform.WindowId) void {
+        var index: usize = 0;
+        while (index < self.webview_count) {
+            if (self.webviews[index].window_id == window_id) {
+                self.removeWebViewAt(index);
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    fn mainWebViewInfo(self: *const Runtime, window_index: usize) RuntimeWebView {
+        const window = self.windows[window_index];
+        const fallback_frame = geometry.RectF.init(0, 0, window.info.frame.width, window.info.frame.height);
+        return .{
+            .window_id = window.info.id,
+            .label = "main",
+            .url = sourceWebViewUrl(window.source),
+            .frame = if (window.main_frame_set) window.main_frame else fallback_frame,
+            .layer = window.main_layer,
+            .zoom = window.main_zoom,
+            .transparent = false,
+            .bridge_enabled = true,
+            .open = window.info.open,
+        };
+    }
+
     fn focusWindowFromJson(self: *Runtime, payload: []const u8, output: []u8) ![]const u8 {
         var storage = json.StringStorage.init(output);
         const window_id = try self.resolveWindowSelector(payload, &storage);
@@ -785,9 +1092,61 @@ const RunContext = struct {
 const RuntimeWindow = struct {
     info: platform.WindowInfo = .{},
     source: ?platform.WebViewSource = null,
+    main_frame: geometry.RectF = geometry.RectF.init(0, 0, 0, 0),
+    main_frame_set: bool = false,
+    main_layer: i32 = 0,
+    main_zoom: f64 = 1.0,
     label_storage: [platform.max_window_label_bytes]u8 = undefined,
     title_storage: [platform.max_window_title_bytes]u8 = undefined,
     source_storage: [platform.max_window_source_bytes]u8 = undefined,
+};
+
+const RuntimeWebView = struct {
+    window_id: platform.WindowId = 1,
+    label: []const u8 = "",
+    url: []const u8 = "",
+    frame: geometry.RectF = geometry.RectF.init(0, 0, 0, 0),
+    layer: i32 = 0,
+    zoom: f64 = 1.0,
+    transparent: bool = false,
+    bridge_enabled: bool = false,
+    open: bool = false,
+    label_storage: [platform.max_webview_label_bytes]u8 = undefined,
+    url_storage: [platform.max_webview_url_bytes]u8 = undefined,
+};
+
+const AsyncBridgeResponseSlot = struct {
+    in_use: bool = false,
+    runtime: ?*Runtime = null,
+    source: bridge.Source = .{},
+    origin_storage: [max_bridge_origin_bytes]u8 = undefined,
+    webview_label_storage: [platform.max_webview_label_bytes]u8 = undefined,
+
+    fn init(self: *AsyncBridgeResponseSlot, runtime: *Runtime, source: bridge.Source) !void {
+        if (source.origin.len > self.origin_storage.len) return error.BridgeOriginTooLarge;
+        if (source.webview_label.len > self.webview_label_storage.len) return error.WebViewLabelTooLarge;
+        self.runtime = runtime;
+        self.source = .{
+            .origin = try copyInto(&self.origin_storage, source.origin),
+            .window_id = source.window_id,
+            .webview_label = try copyInto(&self.webview_label_storage, source.webview_label),
+        };
+        self.in_use = true;
+    }
+
+    fn release(self: *AsyncBridgeResponseSlot) void {
+        self.in_use = false;
+        self.runtime = null;
+        self.source = .{};
+    }
+
+    fn respond(self: *AsyncBridgeResponseSlot, response: []const u8) anyerror!void {
+        if (!self.in_use) return error.AsyncBridgeResponseAlreadyCompleted;
+        const runtime = self.runtime orelse return error.AsyncBridgeResponseAlreadyCompleted;
+        const source = self.source;
+        defer self.release();
+        try runtime.respondToBridge(source, response);
+    }
 };
 
 fn copyInto(buffer: []u8, value: []const u8) ![]const u8 {
@@ -796,10 +1155,50 @@ fn copyInto(buffer: []u8, value: []const u8) ![]const u8 {
     return buffer[0..value.len];
 }
 
+fn sourceWebViewUrl(source: ?platform.WebViewSource) []const u8 {
+    const value = source orelse return "";
+    return switch (value.kind) {
+        .html => "zero://inline",
+        .url, .assets => value.bytes,
+    };
+}
+
 fn writeWindowJson(window: platform.WindowInfo, output: []u8) ![]const u8 {
     var writer = std.Io.Writer.fixed(output);
     try writeWindowJsonToWriter(window, &writer);
     return writer.buffered();
+}
+
+fn writeWebViewOkJson(label: []const u8, window_id: platform.WindowId, output: []u8) ![]const u8 {
+    var writer = std.Io.Writer.fixed(output);
+    try writer.writeAll("{\"label\":");
+    try json.writeString(&writer, label);
+    try writer.print(",\"windowId\":{d}}}", .{window_id});
+    return writer.buffered();
+}
+
+fn writeWebViewJson(webview: RuntimeWebView, output: []u8) ![]const u8 {
+    var writer = std.Io.Writer.fixed(output);
+    try writeWebViewJsonToWriter(webview, &writer);
+    return writer.buffered();
+}
+
+fn writeWebViewJsonToWriter(webview: RuntimeWebView, writer: anytype) !void {
+    try writer.writeAll("{\"label\":");
+    try json.writeString(writer, webview.label);
+    try writer.print(",\"windowId\":{d},\"url\":", .{webview.window_id});
+    try json.writeString(writer, webview.url);
+    try writer.print(",\"x\":{d},\"y\":{d},\"width\":{d},\"height\":{d},\"layer\":{d},\"zoom\":{d},\"transparent\":{},\"bridge\":{},\"open\":{}}}", .{
+        webview.frame.x,
+        webview.frame.y,
+        webview.frame.width,
+        webview.frame.height,
+        webview.layer,
+        webview.zoom,
+        webview.transparent,
+        webview.bridge_enabled,
+        webview.open,
+    });
 }
 
 fn writeWindowJsonToWriter(window: platform.WindowInfo, writer: anytype) !void {
@@ -831,6 +1230,23 @@ fn builtinBridgeErrorMessage(err: anyerror) []const u8 {
         error.DuplicateWindowLabel => "Window id or label already exists",
         error.MissingWindowSource => "Window source is missing",
         error.WindowSourceTooLarge => "Window source is too large",
+        error.CreateFailed => "Native view creation failed",
+        error.MissingWebViewUrl => "WebView URL is missing",
+        error.InvalidWebViewWindowId => "windowId must be a non-negative integer",
+        error.CrossWindowWebViewDenied => "WebView windowId must match the calling window",
+        error.InvalidWebViewOptions => "WebView options are invalid",
+        error.WebViewNotFound => "WebView was not found",
+        error.WebViewLimitReached => "WebView limit reached",
+        error.DuplicateWebViewLabel => "WebView label already exists",
+        error.ReservedWebViewLabel => "WebView label \"main\" is reserved for the startup WebView",
+        error.WebViewLabelTooLarge => "WebView label is too large",
+        error.WebViewUrlTooLarge => "WebView URL is too large",
+        error.UnsupportedChildWebViews => "This backend does not support child WebViews yet",
+        error.UnsupportedWebViewBridge => "This backend does not support bridge-enabled child WebViews yet",
+        error.UnsupportedMainWebViewFrame => "This backend does not support resizing the main WebView yet",
+        error.UnsupportedMainWebViewZoom => "This backend does not support zooming the main WebView yet",
+        error.UnsupportedMainWebViewLayer => "This backend does not support changing the main WebView layer",
+        error.NavigationDenied => "WebView URL is not allowed by navigation policy",
         error.InvalidWindowOptions => "Window options are invalid",
         error.DuplicateWindowId => "Window id already exists",
         error.NoSpaceLeft => "Native response buffer is too small",
@@ -838,8 +1254,93 @@ fn builtinBridgeErrorMessage(err: anyerror) []const u8 {
     };
 }
 
+fn builtinBridgeErrorCode(err: anyerror) bridge.ErrorCode {
+    return switch (err) {
+        error.UnsupportedService,
+        error.MissingWebViewUrl,
+        error.InvalidWebViewWindowId,
+        error.CrossWindowWebViewDenied,
+        error.InvalidWebViewOptions,
+        error.WindowNotFound,
+        error.WebViewNotFound,
+        error.WebViewLimitReached,
+        error.DuplicateWebViewLabel,
+        error.ReservedWebViewLabel,
+        error.WebViewLabelTooLarge,
+        error.WebViewUrlTooLarge,
+        error.UnsupportedChildWebViews,
+        error.UnsupportedWebViewBridge,
+        error.UnsupportedMainWebViewFrame,
+        error.UnsupportedMainWebViewZoom,
+        error.UnsupportedMainWebViewLayer,
+        => .invalid_request,
+        error.NavigationDenied => .invalid_request,
+        else => .internal_error,
+    };
+}
+
 fn jsonStringField(payload: []const u8, field: []const u8, storage: *json.StringStorage) ?[]const u8 {
     return json.stringField(payload, field, storage);
+}
+
+fn webViewWindowIdFromJson(payload: []const u8, default_window_id: platform.WindowId) !platform.WindowId {
+    if (json.fieldValue(payload, "windowId") == null) return default_window_id;
+    const window_id = jsonIntegerField(payload, "windowId") orelse return error.InvalidWebViewWindowId;
+    if (window_id != default_window_id) return error.CrossWindowWebViewDenied;
+    return window_id;
+}
+
+fn webViewFrameFromJson(payload: []const u8) !geometry.RectF {
+    const frame_payload = json.fieldValue(payload, "frame") orelse payload;
+    const width = jsonNumberField(frame_payload, "width") orelse return error.InvalidWebViewOptions;
+    const height = jsonNumberField(frame_payload, "height") orelse return error.InvalidWebViewOptions;
+    const frame = geometry.RectF.init(
+        jsonNumberField(frame_payload, "x") orelse 0,
+        jsonNumberField(frame_payload, "y") orelse 0,
+        width,
+        height,
+    );
+    if (frame.x < 0 or frame.y < 0 or frame.width <= 0 or frame.height <= 0) return error.InvalidWebViewOptions;
+    return frame;
+}
+
+fn webViewLayerFromJson(payload: []const u8) !i32 {
+    if (json.fieldValue(payload, "layer") == null) return 0;
+    const layer_bytes = json.fieldValue(payload, "layer") orelse return error.InvalidWebViewOptions;
+    const layer_value = std.fmt.parseFloat(f64, layer_bytes) catch return error.InvalidWebViewOptions;
+    if (!std.math.isFinite(layer_value)) return error.InvalidWebViewOptions;
+    if (@trunc(layer_value) != layer_value) return error.InvalidWebViewOptions;
+    const max_layer: f64 = @floatFromInt(std.math.maxInt(i32));
+    const min_layer: f64 = @floatFromInt(std.math.minInt(i32));
+    if (layer_value > max_layer or layer_value < min_layer) return error.InvalidWebViewOptions;
+    return @as(i32, @intFromFloat(layer_value));
+}
+
+fn isMainWebViewLabel(label: []const u8) bool {
+    return std.mem.eql(u8, label, "main");
+}
+
+fn validateWebViewLabel(label: []const u8) !void {
+    if (label.len == 0) return error.InvalidWebViewOptions;
+    if (label.len > platform.max_webview_label_bytes) return error.WebViewLabelTooLarge;
+}
+
+fn validateChildWebViewLabel(label: []const u8) !void {
+    try validateWebViewLabel(label);
+    if (isMainWebViewLabel(label)) return error.ReservedWebViewLabel;
+}
+
+fn webViewUrlOrigin(url: []const u8, buffer: []u8) ![]const u8 {
+    if (std.mem.startsWith(u8, url, "about:")) return "about://local";
+    const scheme_end = std.mem.indexOf(u8, url, "://") orelse return error.InvalidWebViewOptions;
+    const host_start = scheme_end + 3;
+    if (host_start >= url.len) return error.InvalidWebViewOptions;
+    var host_end = host_start;
+    while (host_end < url.len and url[host_end] != '/' and url[host_end] != '?' and url[host_end] != '#') : (host_end += 1) {}
+    if (host_end == host_start) return error.InvalidWebViewOptions;
+    if (host_end > buffer.len) return error.InvalidWebViewOptions;
+    @memcpy(buffer[0..host_end], url[0..host_end]);
+    return buffer[0..host_end];
 }
 
 fn jsonNumberField(payload: []const u8, field: []const u8) ?f32 {
@@ -1001,6 +1502,45 @@ test "runtime dispatches bridge messages through policy and handler registry" {
     try std.testing.expectEqualStrings("{\"id\":\"1\",\"ok\":true,\"result\":{\"pong\":true,\"calls\":1}}", harness.null_platform.lastBridgeResponse());
 }
 
+test "runtime keeps async bridge response source labels stable" {
+    const AsyncState = struct {
+        responder: ?bridge.AsyncResponder = null,
+
+        fn later(context: *anyopaque, invocation: bridge.Invocation, responder: bridge.AsyncResponder) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            try std.testing.expectEqualStrings("native.later", invocation.request.command);
+            try std.testing.expectEqualStrings("preview", invocation.source.webview_label);
+            try std.testing.expectEqualStrings("https://example.com", invocation.source.origin);
+            self.responder = responder;
+        }
+    };
+
+    var async_state: AsyncState = .{};
+    const policies = [_]bridge.CommandPolicy{.{ .name = "native.later", .origins = &.{"https://example.com"} }};
+    const handlers = [_]bridge.AsyncHandler{.{ .name = "native.later", .context = &async_state, .invoke_fn = AsyncState.later }};
+
+    var harness: TestHarness() = undefined;
+    harness.init(.{});
+    harness.runtime.options.bridge = .{
+        .policy = .{ .enabled = true, .commands = &policies },
+        .async_registry = .{ .handlers = &handlers },
+    };
+
+    var label_buffer = [_]u8{ 'p', 'r', 'e', 'v', 'i', 'e', 'w' };
+    const app = App{ .context = &async_state, .name = "async-bridge", .source = platform.WebViewSource.html("<p>Bridge</p>") };
+    try harness.runtime.dispatchPlatformEvent(app, .{ .bridge_message = .{
+        .bytes = "{\"id\":\"async\",\"command\":\"native.later\",\"payload\":null}",
+        .origin = "https://example.com",
+        .window_id = 1,
+        .webview_label = label_buffer[0..],
+    } });
+
+    @memcpy(label_buffer[0..], "changed");
+    try async_state.responder.?.success("async", "{\"delayed\":true}");
+    try std.testing.expectEqualStrings("preview", harness.null_platform.lastBridgeResponseWebViewLabel());
+    try std.testing.expectEqualStrings("{\"id\":\"async\",\"ok\":true,\"result\":{\"delayed\":true}}", harness.null_platform.lastBridgeResponse());
+}
+
 test "runtime maps bridge dispatch failures to response errors" {
     const FailingState = struct {
         fn fail(context: *anyopaque, invocation: bridge.Invocation, output: []u8) anyerror![]const u8 {
@@ -1094,6 +1634,8 @@ test "runtime handles built-in JavaScript window bridge commands" {
     var harness: TestHarness() = undefined;
     harness.init(.{});
     harness.runtime.options.js_window_api = true;
+    const webview_origins = [_][]const u8{ "zero://inline", "https://example.com", "https://example.org" };
+    harness.runtime.options.security.navigation.allowed_origins = &webview_origins;
     var app_state: TestApp = .{};
     try harness.start(app_state.app());
 
@@ -1126,6 +1668,382 @@ test "runtime handles built-in JavaScript window bridge commands" {
         .window_id = 1,
     } });
     try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"open\":false") != null);
+}
+
+test "runtime handles built-in JavaScript webview bridge commands" {
+    const TestApp = struct {
+        fn app(self: *@This()) App {
+            return .{ .context = self, .name = "webview-bridge", .source = platform.WebViewSource.html("<p>WebView</p>") };
+        }
+    };
+
+    var harness: TestHarness() = undefined;
+    harness.init(.{});
+    harness.runtime.options.js_window_api = true;
+    const webview_origins = [_][]const u8{ "zero://inline", "https://example.com", "https://example.org" };
+    harness.runtime.options.security.navigation.allowed_origins = &webview_origins;
+    var app_state: TestApp = .{};
+    try harness.start(app_state.app());
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"1\",\"command\":\"zero-native.webview.create\",\"payload\":{\"label\":\"preview\",\"url\":\"https://example.com\",\"frame\":{\"x\":10,\"y\":20,\"width\":300,\"height\":200},\"layer\":2,\"transparent\":true,\"bridge\":false}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"ok\":true") != null);
+    try std.testing.expectEqual(@as(usize, 1), harness.null_platform.webview_count);
+    try std.testing.expectEqualStrings("preview", harness.null_platform.webviews[0].label);
+    try std.testing.expectEqualStrings("https://example.com", harness.null_platform.webviews[0].url);
+    try std.testing.expectEqual(@as(i32, 2), harness.null_platform.webviews[0].layer);
+    try std.testing.expect(harness.null_platform.webviews[0].transparent);
+    try std.testing.expect(!harness.null_platform.webviews[0].bridge_enabled);
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"2\",\"command\":\"zero-native.webview.setFrame\",\"payload\":{\"label\":\"preview\",\"frame\":{\"x\":11,\"y\":22,\"width\":333,\"height\":222}}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expectEqual(@as(f32, 333), harness.null_platform.webviews[0].frame.width);
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"3\",\"command\":\"zero-native.webview.navigate\",\"payload\":{\"label\":\"preview\",\"url\":\"https://example.org\"}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expectEqualStrings("https://example.org", harness.null_platform.webviews[0].url);
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"4\",\"command\":\"zero-native.webview.setZoom\",\"payload\":{\"label\":\"preview\",\"zoom\":1.25}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expectEqual(@as(f64, 1.25), harness.null_platform.webviews[0].zoom);
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"zoom\":1.25") != null);
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"5\",\"command\":\"zero-native.webview.setLayer\",\"payload\":{\"label\":\"preview\",\"layer\":10}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expectEqual(@as(i32, 10), harness.null_platform.webviews[0].layer);
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"6\",\"command\":\"zero-native.webview.list\",\"payload\":{}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"label\":\"main\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"url\":\"zero://inline\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"layer\":10") != null);
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"7\",\"command\":\"zero-native.webview.setFrame\",\"payload\":{\"label\":\"main\",\"frame\":{\"x\":0,\"y\":0,\"width\":640,\"height\":80}}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"label\":\"main\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"height\":80") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"zoom\":1") != null);
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"8\",\"command\":\"zero-native.webview.setZoom\",\"payload\":{\"label\":\"main\",\"zoom\":1.1}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"label\":\"main\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"height\":80") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"zoom\":1.1") != null);
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"9\",\"command\":\"zero-native.webview.list\",\"payload\":{}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+        .webview_label = "preview",
+    } });
+    try std.testing.expectEqualStrings("preview", harness.null_platform.lastBridgeResponseWebViewLabel());
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"9\",\"command\":\"zero-native.webview.list\",\"payload\":{}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+        .webview_label = "main",
+    } });
+    try std.testing.expectEqualStrings("main", harness.null_platform.lastBridgeResponseWebViewLabel());
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"10\",\"command\":\"zero-native.webview.close\",\"payload\":{\"label\":\"preview\"}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expectEqual(@as(usize, 0), harness.null_platform.webview_count);
+}
+
+test "runtime returns closed webview info before compacting storage" {
+    const TestApp = struct {
+        fn app(self: *@This()) App {
+            return .{ .context = self, .name = "webview-close-response", .source = platform.WebViewSource.html("<p>WebView</p>") };
+        }
+    };
+
+    var harness: TestHarness() = undefined;
+    harness.init(.{});
+    harness.runtime.options.js_window_api = true;
+    const webview_origins = [_][]const u8{ "zero://inline", "https://example.com" };
+    harness.runtime.options.security.navigation.allowed_origins = &webview_origins;
+    var app_state: TestApp = .{};
+    try harness.start(app_state.app());
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"first\",\"command\":\"zero-native.webview.create\",\"payload\":{\"label\":\"first\",\"url\":\"https://example.com/first\",\"frame\":{\"width\":300,\"height\":200}}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"second\",\"command\":\"zero-native.webview.create\",\"payload\":{\"label\":\"second\",\"url\":\"https://example.com/second\",\"frame\":{\"width\":300,\"height\":200}}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"close-first\",\"command\":\"zero-native.webview.close\",\"payload\":{\"label\":\"first\"}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"label\":\"first\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"label\":\"second\"") == null);
+    try std.testing.expectEqual(@as(usize, 1), harness.null_platform.webview_count);
+    try std.testing.expectEqualStrings("second", harness.null_platform.webviews[0].label);
+}
+
+test "runtime defaults webview commands to source window" {
+    const TestApp = struct {
+        fn app(self: *@This()) App {
+            return .{ .context = self, .name = "webview-source-window", .source = platform.WebViewSource.html("<p>WebView</p>") };
+        }
+    };
+
+    var harness: TestHarness() = undefined;
+    harness.init(.{});
+    harness.runtime.options.js_window_api = true;
+    const webview_origins = [_][]const u8{ "zero://inline", "https://example.com" };
+    harness.runtime.options.security.navigation.allowed_origins = &webview_origins;
+    var app_state: TestApp = .{};
+    try harness.start(app_state.app());
+    const secondary = try harness.runtime.createWindow(.{ .label = "secondary" });
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"1\",\"command\":\"zero-native.webview.create\",\"payload\":{\"label\":\"preview\",\"url\":\"https://example.com\",\"frame\":{\"width\":300,\"height\":200}}}",
+        .origin = "zero://inline",
+        .window_id = secondary.id,
+    } });
+
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"ok\":true") != null);
+    try std.testing.expectEqual(secondary.id, harness.null_platform.webviews[0].window_id);
+    try std.testing.expectEqual(secondary.id, harness.null_platform.lastBridgeResponseWindowId());
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"windowId\":2") != null);
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"2\",\"command\":\"zero-native.webview.create\",\"payload\":{\"windowId\":2,\"label\":\"cross-window\",\"url\":\"https://example.com\",\"frame\":{\"width\":300,\"height\":200}}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "must match the calling window") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"invalid_request\"") != null);
+}
+
+test "runtime validates webview bridge commands" {
+    const TestApp = struct {
+        fn app(self: *@This()) App {
+            return .{ .context = self, .name = "webview-validation", .source = platform.WebViewSource.html("<p>WebView</p>") };
+        }
+    };
+
+    var harness: TestHarness() = undefined;
+    harness.init(.{});
+    harness.runtime.options.js_window_api = true;
+    const webview_origins = [_][]const u8{ "zero://inline", "https://example.com", "https://example.org" };
+    harness.runtime.options.security.navigation.allowed_origins = &webview_origins;
+    var app_state: TestApp = .{};
+    try harness.start(app_state.app());
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"missing-url\",\"command\":\"zero-native.webview.create\",\"payload\":{\"label\":\"preview\",\"frame\":{\"width\":300,\"height\":200}}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "WebView URL is missing") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"invalid_request\"") != null);
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"invalid-frame\",\"command\":\"zero-native.webview.create\",\"payload\":{\"label\":\"preview\",\"url\":\"https://example.com\",\"frame\":{\"width\":0,\"height\":200}}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "WebView options are invalid") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"invalid_request\"") != null);
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"reserved-label\",\"command\":\"zero-native.webview.create\",\"payload\":{\"label\":\"main\",\"url\":\"https://example.com\",\"frame\":{\"width\":300,\"height\":200}}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "reserved") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"invalid_request\"") != null);
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"invalid-layer\",\"command\":\"zero-native.webview.create\",\"payload\":{\"label\":\"bad-layer\",\"url\":\"https://example.com\",\"frame\":{\"width\":300,\"height\":200},\"layer\":1e1000}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "WebView options are invalid") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"invalid_request\"") != null);
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"max-layer\",\"command\":\"zero-native.webview.create\",\"payload\":{\"label\":\"max-layer\",\"url\":\"https://example.com\",\"frame\":{\"width\":300,\"height\":200},\"layer\":2147483647}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"layer\":2147483647") != null);
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"out-of-range-layer\",\"command\":\"zero-native.webview.create\",\"payload\":{\"label\":\"bad-layer-range\",\"url\":\"https://example.com\",\"frame\":{\"width\":300,\"height\":200},\"layer\":100000000000000000000}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "WebView options are invalid") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"invalid_request\"") != null);
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"i32-overflow-layer\",\"command\":\"zero-native.webview.create\",\"payload\":{\"label\":\"i32-overflow-layer\",\"url\":\"https://example.com\",\"frame\":{\"width\":300,\"height\":200},\"layer\":2147483648}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "WebView options are invalid") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"invalid_request\"") != null);
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"min-layer\",\"command\":\"zero-native.webview.create\",\"payload\":{\"label\":\"min-layer\",\"url\":\"https://example.com\",\"frame\":{\"width\":300,\"height\":200},\"layer\":-2147483648}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"layer\":-2147483648") != null);
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"i32-underflow-layer\",\"command\":\"zero-native.webview.create\",\"payload\":{\"label\":\"i32-underflow-layer\",\"url\":\"https://example.com\",\"frame\":{\"width\":300,\"height\":200},\"layer\":-2147483649}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "WebView options are invalid") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"invalid_request\"") != null);
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"fractional-layer\",\"command\":\"zero-native.webview.create\",\"payload\":{\"label\":\"fractional-layer\",\"url\":\"https://example.com\",\"frame\":{\"width\":300,\"height\":200},\"layer\":1.5}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "WebView options are invalid") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"invalid_request\"") != null);
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"ok\",\"command\":\"zero-native.webview.create\",\"payload\":{\"label\":\"preview\",\"url\":\"https://example.com\",\"frame\":{\"width\":300,\"height\":200}}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"ok\":true") != null);
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"duplicate\",\"command\":\"zero-native.webview.create\",\"payload\":{\"label\":\"preview\",\"url\":\"https://example.org\",\"frame\":{\"width\":300,\"height\":200}}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "WebView label already exists") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"invalid_request\"") != null);
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"missing-window\",\"command\":\"zero-native.webview.create\",\"payload\":{\"windowId\":99,\"label\":\"other\",\"url\":\"https://example.com\",\"frame\":{\"width\":300,\"height\":200}}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "must match the calling window") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"invalid_request\"") != null);
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"bad-window-id\",\"command\":\"zero-native.webview.create\",\"payload\":{\"windowId\":\"1\",\"label\":\"bad-window-id\",\"url\":\"https://example.com\",\"frame\":{\"width\":300,\"height\":200}}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "windowId must be a non-negative integer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"invalid_request\"") != null);
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"missing-webview\",\"command\":\"zero-native.webview.setFrame\",\"payload\":{\"label\":\"missing\",\"frame\":{\"width\":300,\"height\":200}}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "WebView was not found") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"invalid_request\"") != null);
+
+    var long_label = [_]u8{'a'} ** (platform.max_webview_label_bytes + 1);
+    var long_label_request_buffer: [512]u8 = undefined;
+    const long_label_request = try std.fmt.bufPrint(&long_label_request_buffer, "{{\"id\":\"long-label\",\"command\":\"zero-native.webview.create\",\"payload\":{{\"label\":\"{s}\",\"url\":\"https://example.com\",\"frame\":{{\"width\":300,\"height\":200}}}}}}", .{&long_label});
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = long_label_request,
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "WebView label is too large") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"invalid_request\"") != null);
+
+    var long_url = [_]u8{'a'} ** (platform.max_webview_url_bytes + 1);
+    var long_url_request_buffer: [platform.max_webview_url_bytes + 256]u8 = undefined;
+    const long_url_request = try std.fmt.bufPrint(&long_url_request_buffer, "{{\"id\":\"long-url\",\"command\":\"zero-native.webview.create\",\"payload\":{{\"label\":\"too-long-url\",\"url\":\"{s}\",\"frame\":{{\"width\":300,\"height\":200}}}}}}", .{&long_url});
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = long_url_request,
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "WebView URL is too large") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"invalid_request\"") != null);
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"denied-url\",\"command\":\"zero-native.webview.navigate\",\"payload\":{\"label\":\"preview\",\"url\":\"https://blocked.example\",\"frame\":{\"width\":300,\"height\":200}}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"invalid_request\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "navigation policy") != null);
+
+    harness.runtime.options.platform.services.set_webview_zoom_fn = null;
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"unsupported-zoom\",\"command\":\"zero-native.webview.setZoom\",\"payload\":{\"label\":\"preview\",\"zoom\":1.25}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "not available on this platform") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"invalid_request\"") != null);
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"escaped\",\"command\":\"zero-native.webview.create\",\"payload\":{\"label\":\"preview \\\"quoted\\\"\",\"url\":\"https://example.com\",\"frame\":{\"width\":300,\"height\":200}}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"label\":\"preview \\\"quoted\\\"\"") != null);
+}
+
+test "runtime reports actionable unsupported webview capability errors" {
+    try std.testing.expectEqual(bridge.ErrorCode.invalid_request, builtinBridgeErrorCode(error.UnsupportedChildWebViews));
+    try std.testing.expectEqual(bridge.ErrorCode.invalid_request, builtinBridgeErrorCode(error.UnsupportedWebViewBridge));
+    try std.testing.expectEqual(bridge.ErrorCode.invalid_request, builtinBridgeErrorCode(error.UnsupportedMainWebViewFrame));
+    try std.testing.expectEqual(bridge.ErrorCode.invalid_request, builtinBridgeErrorCode(error.UnsupportedMainWebViewZoom));
+    try std.testing.expectEqual(bridge.ErrorCode.invalid_request, builtinBridgeErrorCode(error.UnsupportedMainWebViewLayer));
+    try std.testing.expectEqualStrings("This backend does not support child WebViews yet", builtinBridgeErrorMessage(error.UnsupportedChildWebViews));
+    try std.testing.expectEqualStrings("This backend does not support bridge-enabled child WebViews yet", builtinBridgeErrorMessage(error.UnsupportedWebViewBridge));
+    try std.testing.expectEqualStrings("This backend does not support resizing the main WebView yet", builtinBridgeErrorMessage(error.UnsupportedMainWebViewFrame));
+    try std.testing.expectEqualStrings("This backend does not support zooming the main WebView yet", builtinBridgeErrorMessage(error.UnsupportedMainWebViewZoom));
+    try std.testing.expectEqualStrings("This backend does not support changing the main WebView layer", builtinBridgeErrorMessage(error.UnsupportedMainWebViewLayer));
 }
 
 test "runtime gates JavaScript window API by origin and configured permission" {
@@ -1167,6 +2085,48 @@ test "runtime gates JavaScript window API by origin and configured permission" {
     try std.testing.expect(std.mem.indexOf(u8, allowed.null_platform.lastBridgeResponse(), "\"ok\":true") != null);
 }
 
+test "runtime gates JavaScript webview API by origin and configured permission" {
+    var app_state: u8 = 0;
+    const app = App{ .context = &app_state, .name = "webview-api-security", .source = platform.WebViewSource.html("<p>WebViews</p>") };
+
+    var denied_origin: TestHarness() = undefined;
+    denied_origin.init(.{});
+    denied_origin.runtime.options.js_window_api = true;
+    try denied_origin.runtime.dispatchPlatformEvent(app, .{ .bridge_message = .{
+        .bytes = "{\"id\":\"origin\",\"command\":\"zero-native.webview.create\",\"payload\":{\"url\":\"https://example.com\",\"frame\":{\"width\":300,\"height\":200}}}",
+        .origin = "https://example.invalid",
+        .window_id = 1,
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, denied_origin.null_platform.lastBridgeResponse(), "WebView API is not permitted") != null);
+
+    const filesystem_only = [_][]const u8{security.permission_filesystem};
+    var denied_permission: TestHarness() = undefined;
+    denied_permission.init(.{});
+    denied_permission.runtime.options.js_window_api = true;
+    denied_permission.runtime.options.security.permissions = &filesystem_only;
+    try denied_permission.runtime.dispatchPlatformEvent(app, .{ .bridge_message = .{
+        .bytes = "{\"id\":\"permission\",\"command\":\"zero-native.webview.create\",\"payload\":{\"url\":\"https://example.com\",\"frame\":{\"width\":300,\"height\":200}}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, denied_permission.null_platform.lastBridgeResponse(), "\"permission_denied\"") != null);
+
+    const window_permission = [_][]const u8{security.permission_window};
+    const webview_origins = [_][]const u8{ "zero://inline", "https://example.com" };
+    var allowed: TestHarness() = undefined;
+    allowed.init(.{});
+    allowed.runtime.options.js_window_api = true;
+    allowed.runtime.options.security.permissions = &window_permission;
+    allowed.runtime.options.security.navigation.allowed_origins = &webview_origins;
+    try allowed.runtime.dispatchPlatformEvent(app, .app_start);
+    try allowed.runtime.dispatchPlatformEvent(app, .{ .bridge_message = .{
+        .bytes = "{\"id\":\"allowed\",\"command\":\"zero-native.webview.create\",\"payload\":{\"url\":\"https://example.com\",\"frame\":{\"width\":300,\"height\":200}}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, allowed.null_platform.lastBridgeResponse(), "\"ok\":true") != null);
+}
+
 test "runtime gates built-in bridge commands through explicit policy" {
     const TestApp = struct {
         fn app(self: *@This()) App {
@@ -1177,17 +2137,27 @@ test "runtime gates built-in bridge commands through explicit policy" {
     const window_permissions = [_][]const u8{security.permission_window};
     const policies = [_]bridge.CommandPolicy{
         .{ .name = "zero-native.window.create", .permissions = &window_permissions, .origins = &.{"zero://inline"} },
+        .{ .name = "zero-native.webview.create", .permissions = &window_permissions, .origins = &.{"zero://inline"} },
     };
 
     var harness: TestHarness() = undefined;
     harness.init(.{});
     harness.runtime.options.security.permissions = &window_permissions;
+    const webview_origins = [_][]const u8{ "zero://inline", "https://example.com" };
+    harness.runtime.options.security.navigation.allowed_origins = &webview_origins;
     harness.runtime.options.builtin_bridge = .{ .enabled = true, .commands = &policies };
     var app_state: TestApp = .{};
     try harness.start(app_state.app());
 
     try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
         .bytes = "{\"id\":\"1\",\"command\":\"zero-native.window.create\",\"payload\":{\"label\":\"policy-window\",\"title\":\"Policy\",\"width\":320,\"height\":240}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"ok\":true") != null);
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"webview\",\"command\":\"zero-native.webview.create\",\"payload\":{\"label\":\"policy-webview\",\"url\":\"https://example.com\",\"frame\":{\"width\":320,\"height\":240}}}",
         .origin = "zero://inline",
         .window_id = 1,
     } });

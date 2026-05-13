@@ -13,6 +13,19 @@ pub const Error = error{
     WindowSourceTooLarge,
     FocusFailed,
     CloseFailed,
+    MissingWebViewUrl,
+    InvalidWebViewOptions,
+    WebViewNotFound,
+    WebViewLimitReached,
+    DuplicateWebViewLabel,
+    WebViewLabelTooLarge,
+    WebViewUrlTooLarge,
+    UnsupportedChildWebViews,
+    UnsupportedWebViewBridge,
+    UnsupportedMainWebViewFrame,
+    UnsupportedMainWebViewZoom,
+    UnsupportedMainWebViewLayer,
+    NavigationDenied,
 };
 
 pub const WebEngine = enum {
@@ -56,6 +69,9 @@ pub const max_windows: usize = 16;
 pub const max_window_label_bytes: usize = 64;
 pub const max_window_title_bytes: usize = 128;
 pub const max_window_source_bytes: usize = 4096;
+pub const max_webviews: usize = 16;
+pub const max_webview_label_bytes: usize = 64;
+pub const max_webview_url_bytes: usize = 4096;
 
 pub const WindowRestorePolicy = enum {
     clamp_to_visible_screen,
@@ -133,6 +149,28 @@ pub const WindowCreateOptions = struct {
     }
 };
 
+pub const WebViewOptions = struct {
+    window_id: WindowId = 1,
+    label: []const u8,
+    url: []const u8,
+    frame: geometry.RectF = geometry.RectF.init(0, 0, 0, 0),
+    layer: i32 = 0,
+    transparent: bool = false,
+    bridge_enabled: bool = false,
+};
+
+pub const WebViewInfo = struct {
+    window_id: WindowId = 1,
+    label: []const u8 = "webview",
+    url: []const u8 = "",
+    frame: geometry.RectF = geometry.RectF.init(0, 0, 0, 0),
+    layer: i32 = 0,
+    zoom: f64 = 1.0,
+    transparent: bool = false,
+    bridge_enabled: bool = false,
+    open: bool = true,
+};
+
 pub const AppInfo = struct {
     app_name: []const u8 = "zero-native",
     window_title: []const u8 = "",
@@ -178,6 +216,7 @@ pub const BridgeMessage = struct {
     bytes: []const u8,
     origin: []const u8 = "",
     window_id: WindowId = 1,
+    webview_label: []const u8 = "main",
 };
 
 pub const max_dialog_path_bytes: usize = 4096;
@@ -279,9 +318,16 @@ pub const PlatformServices = struct {
     load_window_webview_fn: ?*const fn (context: ?*anyopaque, window_id: WindowId, source: WebViewSource) anyerror!void = null,
     complete_bridge_fn: ?*const fn (context: ?*anyopaque, response: []const u8) anyerror!void = null,
     complete_window_bridge_fn: ?*const fn (context: ?*anyopaque, window_id: WindowId, response: []const u8) anyerror!void = null,
+    complete_webview_bridge_fn: ?*const fn (context: ?*anyopaque, window_id: WindowId, webview_label: []const u8, response: []const u8) anyerror!void = null,
     create_window_fn: ?*const fn (context: ?*anyopaque, options: WindowOptions) anyerror!WindowInfo = null,
     focus_window_fn: ?*const fn (context: ?*anyopaque, window_id: WindowId) anyerror!void = null,
     close_window_fn: ?*const fn (context: ?*anyopaque, window_id: WindowId) anyerror!void = null,
+    create_webview_fn: ?*const fn (context: ?*anyopaque, options: WebViewOptions) anyerror!void = null,
+    set_webview_frame_fn: ?*const fn (context: ?*anyopaque, window_id: WindowId, label: []const u8, frame: geometry.RectF) anyerror!void = null,
+    navigate_webview_fn: ?*const fn (context: ?*anyopaque, window_id: WindowId, label: []const u8, url: []const u8) anyerror!void = null,
+    set_webview_zoom_fn: ?*const fn (context: ?*anyopaque, window_id: WindowId, label: []const u8, zoom: f64) anyerror!void = null,
+    set_webview_layer_fn: ?*const fn (context: ?*anyopaque, window_id: WindowId, label: []const u8, layer: i32) anyerror!void = null,
+    close_webview_fn: ?*const fn (context: ?*anyopaque, window_id: WindowId, label: []const u8) anyerror!void = null,
     show_open_dialog_fn: ?*const fn (context: ?*anyopaque, options: OpenDialogOptions, buffer: []u8) anyerror!OpenDialogResult = null,
     show_save_dialog_fn: ?*const fn (context: ?*anyopaque, options: SaveDialogOptions, buffer: []u8) anyerror!?[]const u8 = null,
     show_message_dialog_fn: ?*const fn (context: ?*anyopaque, options: MessageDialogOptions) anyerror!MessageDialogResult = null,
@@ -325,6 +371,12 @@ pub const PlatformServices = struct {
         return error.UnsupportedService;
     }
 
+    pub fn completeWebViewBridge(self: PlatformServices, window_id: WindowId, webview_label: []const u8, response: []const u8) anyerror!void {
+        if (self.complete_webview_bridge_fn) |complete_fn| return complete_fn(self.context, window_id, webview_label, response);
+        if (!std.mem.eql(u8, webview_label, "main")) return error.UnsupportedService;
+        return self.completeWindowBridge(window_id, response);
+    }
+
     pub fn createWindow(self: PlatformServices, options: WindowOptions) anyerror!WindowInfo {
         const create_fn = self.create_window_fn orelse return error.UnsupportedService;
         return create_fn(self.context, options);
@@ -338,6 +390,36 @@ pub const PlatformServices = struct {
     pub fn closeWindow(self: PlatformServices, window_id: WindowId) anyerror!void {
         const close_fn = self.close_window_fn orelse return error.UnsupportedService;
         return close_fn(self.context, window_id);
+    }
+
+    pub fn createWebView(self: PlatformServices, options: WebViewOptions) anyerror!void {
+        const create_fn = self.create_webview_fn orelse return error.UnsupportedService;
+        return create_fn(self.context, options);
+    }
+
+    pub fn setWebViewFrame(self: PlatformServices, window_id: WindowId, label: []const u8, frame: geometry.RectF) anyerror!void {
+        const set_fn = self.set_webview_frame_fn orelse return error.UnsupportedService;
+        return set_fn(self.context, window_id, label, frame);
+    }
+
+    pub fn navigateWebView(self: PlatformServices, window_id: WindowId, label: []const u8, url: []const u8) anyerror!void {
+        const navigate_fn = self.navigate_webview_fn orelse return error.UnsupportedService;
+        return navigate_fn(self.context, window_id, label, url);
+    }
+
+    pub fn setWebViewZoom(self: PlatformServices, window_id: WindowId, label: []const u8, zoom: f64) anyerror!void {
+        const zoom_fn = self.set_webview_zoom_fn orelse return error.UnsupportedService;
+        return zoom_fn(self.context, window_id, label, zoom);
+    }
+
+    pub fn setWebViewLayer(self: PlatformServices, window_id: WindowId, label: []const u8, layer: i32) anyerror!void {
+        const layer_fn = self.set_webview_layer_fn orelse return error.UnsupportedService;
+        return layer_fn(self.context, window_id, label, layer);
+    }
+
+    pub fn closeWebView(self: PlatformServices, window_id: WindowId, label: []const u8) anyerror!void {
+        const close_fn = self.close_webview_fn orelse return error.UnsupportedService;
+        return close_fn(self.context, window_id, label);
     }
 
     pub fn showOpenDialog(self: PlatformServices, options: OpenDialogOptions, buffer: []u8) anyerror!OpenDialogResult {
@@ -415,9 +497,12 @@ pub const NullPlatform = struct {
     window_sources: [max_windows]?WebViewSource = [_]?WebViewSource{null} ** max_windows,
     windows: [max_windows]WindowInfo = undefined,
     window_count: usize = 0,
+    webviews: [max_webviews]NullWebView = undefined,
+    webview_count: usize = 0,
     bridge_response: [16 * 1024]u8 = undefined,
     bridge_response_len: usize = 0,
     bridge_response_window_id: WindowId = 0,
+    bridge_response_webview_label: []const u8 = "main",
 
     pub fn init(surface_value: Surface) NullPlatform {
         return .{ .surface_value = surface_value };
@@ -443,9 +528,16 @@ pub const NullPlatform = struct {
                 .load_window_webview_fn = loadWindowWebView,
                 .complete_bridge_fn = completeBridge,
                 .complete_window_bridge_fn = completeWindowBridge,
+                .complete_webview_bridge_fn = completeWebViewBridge,
                 .create_window_fn = createWindow,
                 .focus_window_fn = focusWindow,
                 .close_window_fn = closeWindow,
+                .create_webview_fn = createWebView,
+                .set_webview_frame_fn = setWebViewFrame,
+                .navigate_webview_fn = navigateWebView,
+                .set_webview_zoom_fn = setWebViewZoom,
+                .set_webview_layer_fn = setWebViewLayer,
+                .close_webview_fn = closeWebView,
                 .configure_security_policy_fn = configureSecurityPolicy,
                 .emit_window_event_fn = emitWindowEvent,
             },
@@ -493,25 +585,42 @@ pub const NullPlatform = struct {
     fn loadWindowWebView(context: ?*anyopaque, window_id: WindowId, source: WebViewSource) anyerror!void {
         const self: *NullPlatform = @ptrCast(@alignCast(context.?));
         if (window_id == 1) self.loaded_source = source;
-        const index = self.findWindowIndex(window_id) orelse if (window_id == 1) 0 else return error.WindowNotFound;
+        const index = self.findWindowIndex(window_id) orelse if (window_id == 1 and self.window_count == 0) blk: {
+            self.windows[0] = .{
+                .id = 1,
+                .label = "main",
+                .title = self.app_info.resolvedWindowTitle(),
+                .frame = geometry.RectF.fromSize(self.surface_value.size),
+                .scale_factor = self.surface_value.scale_factor,
+                .open = true,
+                .focused = true,
+            };
+            self.window_count = 1;
+            break :blk 0;
+        } else return error.WindowNotFound;
         if (index >= self.window_sources.len) return error.WindowNotFound;
         self.window_sources[index] = source;
     }
 
     fn completeBridge(context: ?*anyopaque, response: []const u8) anyerror!void {
-        try recordBridgeResponse(context, 1, response);
+        try recordBridgeResponse(context, 1, "main", response);
     }
 
     fn completeWindowBridge(context: ?*anyopaque, window_id: WindowId, response: []const u8) anyerror!void {
-        try recordBridgeResponse(context, window_id, response);
+        try recordBridgeResponse(context, window_id, "main", response);
     }
 
-    fn recordBridgeResponse(context: ?*anyopaque, window_id: WindowId, response: []const u8) anyerror!void {
+    fn completeWebViewBridge(context: ?*anyopaque, window_id: WindowId, webview_label: []const u8, response: []const u8) anyerror!void {
+        try recordBridgeResponse(context, window_id, webview_label, response);
+    }
+
+    fn recordBridgeResponse(context: ?*anyopaque, window_id: WindowId, webview_label: []const u8, response: []const u8) anyerror!void {
         const self: *NullPlatform = @ptrCast(@alignCast(context.?));
         const count = @min(response.len, self.bridge_response.len);
         @memcpy(self.bridge_response[0..count], response[0..count]);
         self.bridge_response_len = count;
         self.bridge_response_window_id = window_id;
+        self.bridge_response_webview_label = webview_label;
     }
 
     fn createWindow(context: ?*anyopaque, options: WindowOptions) anyerror!WindowInfo {
@@ -548,6 +657,86 @@ pub const NullPlatform = struct {
         const index = self.findWindowIndex(window_id) orelse return error.WindowNotFound;
         self.windows[index].open = false;
         self.windows[index].focused = false;
+        self.removeWebViewsForWindow(window_id);
+    }
+
+    fn createWebView(context: ?*anyopaque, options: WebViewOptions) anyerror!void {
+        const self: *NullPlatform = @ptrCast(@alignCast(context.?));
+        if (self.findWindowIndex(options.window_id)) |window_index| {
+            if (!self.windows[window_index].open) return error.WindowNotFound;
+        } else if (options.window_id != 1) {
+            return error.WindowNotFound;
+        }
+        if (options.label.len == 0) return error.InvalidWebViewOptions;
+        if (options.url.len == 0) return error.MissingWebViewUrl;
+        if (options.label.len > max_webview_label_bytes) return error.WebViewLabelTooLarge;
+        if (options.url.len > max_webview_url_bytes) return error.WebViewUrlTooLarge;
+        if (!isValidWebViewFrame(options.frame)) return error.InvalidWebViewOptions;
+        if (self.findWebViewIndex(options.window_id, options.label) != null) return error.DuplicateWebViewLabel;
+        if (self.webview_count >= max_webviews) return error.WebViewLimitReached;
+        const index = self.webview_count;
+        self.webview_count += 1;
+        var webview = &self.webviews[index];
+        webview.window_id = options.window_id;
+        webview.frame = options.frame;
+        webview.layer = options.layer;
+        webview.transparent = options.transparent;
+        webview.bridge_enabled = options.bridge_enabled;
+        webview.open = true;
+        @memcpy(webview.label_storage[0..options.label.len], options.label);
+        @memcpy(webview.url_storage[0..options.url.len], options.url);
+        webview.label = webview.label_storage[0..options.label.len];
+        webview.url = webview.url_storage[0..options.url.len];
+    }
+
+    fn setWebViewFrame(context: ?*anyopaque, window_id: WindowId, label: []const u8, frame: geometry.RectF) anyerror!void {
+        const self: *NullPlatform = @ptrCast(@alignCast(context.?));
+        if (std.mem.eql(u8, label, "main")) {
+            _ = self.findWindowIndex(window_id) orelse return error.WindowNotFound;
+            if (!isValidWebViewFrame(frame)) return error.InvalidWebViewOptions;
+            return;
+        }
+        const index = self.findWebViewIndex(window_id, label) orelse return error.WebViewNotFound;
+        if (!isValidWebViewFrame(frame)) return error.InvalidWebViewOptions;
+        self.webviews[index].frame = frame;
+    }
+
+    fn navigateWebView(context: ?*anyopaque, window_id: WindowId, label: []const u8, url: []const u8) anyerror!void {
+        const self: *NullPlatform = @ptrCast(@alignCast(context.?));
+        const index = self.findWebViewIndex(window_id, label) orelse return error.WebViewNotFound;
+        if (url.len == 0) return error.MissingWebViewUrl;
+        if (url.len > max_webview_url_bytes) return error.WebViewUrlTooLarge;
+        var webview = &self.webviews[index];
+        @memcpy(webview.url_storage[0..url.len], url);
+        webview.url = webview.url_storage[0..url.len];
+    }
+
+    fn setWebViewZoom(context: ?*anyopaque, window_id: WindowId, label: []const u8, zoom: f64) anyerror!void {
+        const self: *NullPlatform = @ptrCast(@alignCast(context.?));
+        if (std.mem.eql(u8, label, "main")) {
+            _ = self.findWindowIndex(window_id) orelse return error.WindowNotFound;
+            if (zoom < 0.25 or zoom > 5.0) return error.InvalidWebViewOptions;
+            return;
+        }
+        const index = self.findWebViewIndex(window_id, label) orelse return error.WebViewNotFound;
+        if (zoom < 0.25 or zoom > 5.0) return error.InvalidWebViewOptions;
+        self.webviews[index].zoom = zoom;
+    }
+
+    fn setWebViewLayer(context: ?*anyopaque, window_id: WindowId, label: []const u8, layer: i32) anyerror!void {
+        const self: *NullPlatform = @ptrCast(@alignCast(context.?));
+        if (std.mem.eql(u8, label, "main")) {
+            _ = self.findWindowIndex(window_id) orelse return error.WindowNotFound;
+            return;
+        }
+        const index = self.findWebViewIndex(window_id, label) orelse return error.WebViewNotFound;
+        self.webviews[index].layer = layer;
+    }
+
+    fn closeWebView(context: ?*anyopaque, window_id: WindowId, label: []const u8) anyerror!void {
+        const self: *NullPlatform = @ptrCast(@alignCast(context.?));
+        const index = self.findWebViewIndex(window_id, label) orelse return error.WebViewNotFound;
+        self.removeWebViewAt(index);
     }
 
     fn configureSecurityPolicy(context: ?*anyopaque, policy: security.Policy) anyerror!void {
@@ -569,6 +758,46 @@ pub const NullPlatform = struct {
         return null;
     }
 
+    fn findWebViewIndex(self: *const NullPlatform, window_id: WindowId, label: []const u8) ?usize {
+        for (self.webviews[0..self.webview_count], 0..) |webview, index| {
+            if (webview.open and webview.window_id == window_id and std.mem.eql(u8, webview.label, label)) return index;
+        }
+        return null;
+    }
+
+    fn removeWebViewAt(self: *NullPlatform, index: usize) void {
+        if (index >= self.webview_count) return;
+        var cursor = index;
+        while (cursor + 1 < self.webview_count) : (cursor += 1) {
+            const next = self.webviews[cursor + 1];
+            self.webviews[cursor] = .{
+                .window_id = next.window_id,
+                .frame = next.frame,
+                .layer = next.layer,
+                .transparent = next.transparent,
+                .bridge_enabled = next.bridge_enabled,
+                .zoom = next.zoom,
+                .open = next.open,
+            };
+            @memcpy(self.webviews[cursor].label_storage[0..next.label.len], next.label);
+            @memcpy(self.webviews[cursor].url_storage[0..next.url.len], next.url);
+            self.webviews[cursor].label = self.webviews[cursor].label_storage[0..next.label.len];
+            self.webviews[cursor].url = self.webviews[cursor].url_storage[0..next.url.len];
+        }
+        self.webview_count -= 1;
+    }
+
+    fn removeWebViewsForWindow(self: *NullPlatform, window_id: WindowId) void {
+        var index: usize = 0;
+        while (index < self.webview_count) {
+            if (self.webviews[index].window_id == window_id) {
+                self.removeWebViewAt(index);
+            } else {
+                index += 1;
+            }
+        }
+    }
+
     pub fn lastBridgeResponse(self: *const NullPlatform) []const u8 {
         return self.bridge_response[0..self.bridge_response_len];
     }
@@ -576,7 +805,29 @@ pub const NullPlatform = struct {
     pub fn lastBridgeResponseWindowId(self: *const NullPlatform) WindowId {
         return self.bridge_response_window_id;
     }
+
+    pub fn lastBridgeResponseWebViewLabel(self: *const NullPlatform) []const u8 {
+        return self.bridge_response_webview_label;
+    }
 };
+
+const NullWebView = struct {
+    window_id: WindowId = 1,
+    label: []const u8 = "",
+    url: []const u8 = "",
+    frame: geometry.RectF = geometry.RectF.init(0, 0, 0, 0),
+    layer: i32 = 0,
+    transparent: bool = false,
+    bridge_enabled: bool = false,
+    zoom: f64 = 1.0,
+    open: bool = false,
+    label_storage: [max_webview_label_bytes]u8 = undefined,
+    url_storage: [max_webview_url_bytes]u8 = undefined,
+};
+
+fn isValidWebViewFrame(frame: geometry.RectF) bool {
+    return frame.x >= 0 and frame.y >= 0 and frame.width > 0 and frame.height > 0;
+}
 
 pub const macos = @import("macos/root.zig");
 pub const linux = @import("linux/root.zig");
@@ -622,6 +873,100 @@ test "null platform records bridge response window routing" {
 
     try std.testing.expectEqual(@as(WindowId, 7), null_platform.lastBridgeResponseWindowId());
     try std.testing.expectEqualStrings("{\"ok\":true}", null_platform.lastBridgeResponse());
+}
+
+test "webview bridge fallback only routes main responses" {
+    const Recorder = struct {
+        window_id: WindowId = 0,
+        response: []const u8 = "",
+
+        fn completeWindow(context: ?*anyopaque, window_id: WindowId, response: []const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.window_id = window_id;
+            self.response = response;
+        }
+    };
+
+    var recorder: Recorder = .{};
+    const services = PlatformServices{
+        .context = &recorder,
+        .complete_window_bridge_fn = Recorder.completeWindow,
+    };
+
+    try services.completeWebViewBridge(3, "main", "{\"ok\":true}");
+    try std.testing.expectEqual(@as(WindowId, 3), recorder.window_id);
+    try std.testing.expectEqualStrings("{\"ok\":true}", recorder.response);
+    try std.testing.expectError(error.UnsupportedService, services.completeWebViewBridge(3, "preview", "{\"ok\":true}"));
+}
+
+test "null platform records webview lifecycle" {
+    var null_platform = NullPlatform.init(.{});
+    const services = null_platform.platform().services;
+
+    try services.createWebView(.{
+        .label = "preview",
+        .url = "https://example.com",
+        .frame = geometry.RectF.init(10, 20, 300, 200),
+    });
+    try std.testing.expectEqual(@as(usize, 1), null_platform.webview_count);
+    try std.testing.expectEqualStrings("preview", null_platform.webviews[0].label);
+    try std.testing.expectError(error.DuplicateWebViewLabel, services.createWebView(.{
+        .label = "preview",
+        .url = "https://example.org",
+        .frame = geometry.RectF.init(10, 20, 300, 200),
+    }));
+
+    try services.setWebViewFrame(1, "preview", geometry.RectF.init(11, 22, 333, 222));
+    try std.testing.expectEqual(@as(f32, 333), null_platform.webviews[0].frame.width);
+    try services.navigateWebView(1, "preview", "https://example.org");
+    try std.testing.expectEqualStrings("https://example.org", null_platform.webviews[0].url);
+    try services.closeWebView(1, "preview");
+    try std.testing.expectEqual(@as(usize, 0), null_platform.webview_count);
+}
+
+test "null platform preserves shifted webview storage after close" {
+    var null_platform = NullPlatform.init(.{});
+    const services = null_platform.platform().services;
+
+    try services.createWebView(.{
+        .label = "first",
+        .url = "https://example.com/first",
+        .frame = geometry.RectF.init(10, 20, 300, 200),
+    });
+    try services.createWebView(.{
+        .label = "second",
+        .url = "https://example.com/second",
+        .frame = geometry.RectF.init(10, 20, 300, 200),
+    });
+
+    try services.closeWebView(1, "first");
+    try std.testing.expectEqual(@as(usize, 1), null_platform.webview_count);
+    try std.testing.expectEqualStrings("second", null_platform.webviews[0].label);
+    try std.testing.expectEqualStrings("https://example.com/second", null_platform.webviews[0].url);
+
+    try services.createWebView(.{
+        .label = "third",
+        .url = "https://example.com/third",
+        .frame = geometry.RectF.init(10, 20, 300, 200),
+    });
+    try std.testing.expectEqualStrings("second", null_platform.webviews[0].label);
+    try std.testing.expectEqualStrings("https://example.com/second", null_platform.webviews[0].url);
+    try std.testing.expectEqualStrings("third", null_platform.webviews[1].label);
+    try std.testing.expectEqualStrings("https://example.com/third", null_platform.webviews[1].url);
+}
+
+test "null platform requires an open main window for main webview operations" {
+    var null_platform = NullPlatform.init(.{});
+    const services = null_platform.platform().services;
+
+    try std.testing.expectError(error.WindowNotFound, services.setWebViewFrame(1, "main", geometry.RectF.init(0, 0, 320, 240)));
+    try std.testing.expectError(error.WindowNotFound, services.setWebViewZoom(1, "main", 1.25));
+    try std.testing.expectError(error.WindowNotFound, services.setWebViewLayer(1, "main", 10));
+
+    _ = try services.createWindow(.{ .id = 1, .label = "main" });
+    try services.setWebViewFrame(1, "main", geometry.RectF.init(0, 0, 320, 240));
+    try services.setWebViewZoom(1, "main", 1.25);
+    try services.setWebViewLayer(1, "main", 10);
 }
 
 test "webview asset source records production bundle options" {

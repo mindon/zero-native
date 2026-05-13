@@ -62,6 +62,7 @@ pub fn build(b: *std.Build) void {
         std.debug.panic("invalid app.zon web engine config: {s}", .{@errorName(err)});
     };
     const web_engine = buildWebEngineFromResolved(resolved_web_engine.engine);
+    const browser_web_engine: WebEngineOption = web_engine_override orelse .system;
     const cef_auto_install = resolved_web_engine.cef_auto_install;
     const selected_platform: PlatformOption = switch (platform_option) {
         .auto => if (target.result.os.tag == .macos) .macos else if (target.result.os.tag == .linux) .linux else if (target.result.os.tag == .windows) .windows else .null,
@@ -193,10 +194,21 @@ pub fn build(b: *std.Build) void {
     const run_webview_step = b.step("run-webview", "Run the zero-native WebView example");
     run_webview_step.dependOn(&run_webview.step);
 
+    const browser_cef_dir = cef_dir_override orelse defaultCefDir(selected_platform, "third_party/cef/macos");
+    const run_browser = b.addSystemCommand(&.{ "zig", "build", "run", b.fmt("-Dplatform={s}", .{platform_arg}), b.fmt("-Dtrace={s}", .{@tagName(trace_option)}), b.fmt("-Dweb-engine={s}", .{@tagName(browser_web_engine)}), b.fmt("-Dcef-dir={s}", .{browser_cef_dir}) });
+    run_browser.setCwd(b.path("examples/browser"));
+    const run_browser_step = b.step("run-browser", "Run the zero-native browser example");
+    run_browser_step.dependOn(&run_browser.step);
+
     const build_webview_system = b.addSystemCommand(&.{ "zig", "build", b.fmt("-Dplatform={s}", .{platform_arg}), "-Dweb-engine=system" });
     build_webview_system.setCwd(b.path("examples/webview"));
     const webview_system_link_step = b.step("test-webview-system-link", "Build the WebView example with the system engine");
     webview_system_link_step.dependOn(&build_webview_system.step);
+
+    const build_browser_system = b.addSystemCommand(&.{ "zig", "build", b.fmt("-Dplatform={s}", .{platform_arg}), "-Dweb-engine=system" });
+    build_browser_system.setCwd(b.path("examples/browser"));
+    const browser_system_link_step = b.step("test-browser-system-link", "Build the browser example with the system engine");
+    browser_system_link_step.dependOn(&build_browser_system.step);
 
     const frontend_examples_step = b.step("test-examples-frontends", "Run frontend example tests");
     addExampleTestStep(b, frontend_examples_step, "test-example-next", "Run Next example tests", "examples/next");
@@ -257,6 +269,30 @@ pub fn build(b: *std.Build) void {
         \\response="$(cat "$response_file" 2>/dev/null || true)"
         \\case "$response" in *'"ok":true'*) ;; *) echo "native.ping did not succeed: $response" >&2; exit 1 ;; esac
         \\case "$response" in *'pong from Zig'*) ;; *) echo "native.ping response was unexpected: $response" >&2; exit 1 ;; esac
+        \\rm -f "$response_file"
+        \\printf 'bridge %s\n' '{"id":"webview-create","command":"zero-native.webview.create","payload":{"label":"smoke","url":"https://example.com","frame":{"x":24,"y":24,"width":320,"height":220}}}' > .zig-cache/zero-native-automation/command.txt
+        \\attempts=0
+        \\while [ "$attempts" -lt 50 ] && [ ! -s "$response_file" ]; do attempts=$((attempts + 1)); sleep 0.1; done
+        \\response="$(cat "$response_file" 2>/dev/null || true)"
+        \\case "$response" in *'"ok":true'*) ;; *) echo "webview create did not succeed: $response" >&2; exit 1 ;; esac
+        \\rm -f "$response_file"
+        \\printf 'bridge %s\n' '{"id":"webview-resize","command":"zero-native.webview.setFrame","payload":{"label":"smoke","frame":{"x":36,"y":36,"width":420,"height":260}}}' > .zig-cache/zero-native-automation/command.txt
+        \\attempts=0
+        \\while [ "$attempts" -lt 50 ] && [ ! -s "$response_file" ]; do attempts=$((attempts + 1)); sleep 0.1; done
+        \\response="$(cat "$response_file" 2>/dev/null || true)"
+        \\case "$response" in *'"ok":true'*) ;; *) echo "webview resize did not succeed: $response" >&2; exit 1 ;; esac
+        \\rm -f "$response_file"
+        \\printf 'bridge %s\n' '{"id":"webview-navigate","command":"zero-native.webview.navigate","payload":{"label":"smoke","url":"https://example.com/?smoke=1"}}' > .zig-cache/zero-native-automation/command.txt
+        \\attempts=0
+        \\while [ "$attempts" -lt 50 ] && [ ! -s "$response_file" ]; do attempts=$((attempts + 1)); sleep 0.1; done
+        \\response="$(cat "$response_file" 2>/dev/null || true)"
+        \\case "$response" in *'"ok":true'*) ;; *) echo "webview navigate did not succeed: $response" >&2; exit 1 ;; esac
+        \\rm -f "$response_file"
+        \\printf 'bridge %s\n' '{"id":"webview-close","command":"zero-native.webview.close","payload":{"label":"smoke"}}' > .zig-cache/zero-native-automation/command.txt
+        \\attempts=0
+        \\while [ "$attempts" -lt 50 ] && [ ! -s "$response_file" ]; do attempts=$((attempts + 1)); sleep 0.1; done
+        \\response="$(cat "$response_file" 2>/dev/null || true)"
+        \\case "$response" in *'"ok":true'*) ;; *) echo "webview close did not succeed: $response" >&2; exit 1 ;; esac
         \\echo "webview smoke ok"
         ,
         "sh",
@@ -290,6 +326,30 @@ pub fn build(b: *std.Build) void {
         \\while [ "$attempts" -lt 50 ] && [ ! -s "$response_file" ]; do attempts=$((attempts + 1)); sleep 0.1; done
         \\response="$(cat "$response_file" 2>/dev/null || true)"
         \\case "$response" in *'"ok":true'*'pong from Zig'*) ;; *) echo "native.ping response was unexpected: $response" >&2; exit 1 ;; esac
+        \\rm -f "$response_file"
+        \\printf 'bridge %s\n' '{"id":"webview-create","command":"zero-native.webview.create","payload":{"label":"smoke","url":"https://example.com","frame":{"x":24,"y":24,"width":320,"height":220}}}' > .zig-cache/zero-native-automation/command.txt
+        \\attempts=0
+        \\while [ "$attempts" -lt 50 ] && [ ! -s "$response_file" ]; do attempts=$((attempts + 1)); sleep 0.1; done
+        \\response="$(cat "$response_file" 2>/dev/null || true)"
+        \\case "$response" in *'"ok":true'*) ;; *) echo "cef webview create did not succeed: $response" >&2; exit 1 ;; esac
+        \\rm -f "$response_file"
+        \\printf 'bridge %s\n' '{"id":"webview-resize","command":"zero-native.webview.setFrame","payload":{"label":"smoke","frame":{"x":36,"y":36,"width":420,"height":260}}}' > .zig-cache/zero-native-automation/command.txt
+        \\attempts=0
+        \\while [ "$attempts" -lt 50 ] && [ ! -s "$response_file" ]; do attempts=$((attempts + 1)); sleep 0.1; done
+        \\response="$(cat "$response_file" 2>/dev/null || true)"
+        \\case "$response" in *'"ok":true'*) ;; *) echo "cef webview resize did not succeed: $response" >&2; exit 1 ;; esac
+        \\rm -f "$response_file"
+        \\printf 'bridge %s\n' '{"id":"webview-navigate","command":"zero-native.webview.navigate","payload":{"label":"smoke","url":"https://example.com/?smoke=1"}}' > .zig-cache/zero-native-automation/command.txt
+        \\attempts=0
+        \\while [ "$attempts" -lt 50 ] && [ ! -s "$response_file" ]; do attempts=$((attempts + 1)); sleep 0.1; done
+        \\response="$(cat "$response_file" 2>/dev/null || true)"
+        \\case "$response" in *'"ok":true'*) ;; *) echo "cef webview navigate did not succeed: $response" >&2; exit 1 ;; esac
+        \\rm -f "$response_file"
+        \\printf 'bridge %s\n' '{"id":"webview-close","command":"zero-native.webview.close","payload":{"label":"smoke"}}' > .zig-cache/zero-native-automation/command.txt
+        \\attempts=0
+        \\while [ "$attempts" -lt 50 ] && [ ! -s "$response_file" ]; do attempts=$((attempts + 1)); sleep 0.1; done
+        \\response="$(cat "$response_file" 2>/dev/null || true)"
+        \\case "$response" in *'"ok":true'*) ;; *) echo "cef webview close did not succeed: $response" >&2; exit 1 ;; esac
         \\echo "cef webview smoke ok"
         ,
         "sh",

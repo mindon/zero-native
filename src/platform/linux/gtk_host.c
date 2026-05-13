@@ -7,11 +7,26 @@
 #include <stdio.h>
 
 #define ZERO_NATIVE_MAX_WINDOWS 16
+#define ZERO_NATIVE_MAX_WEBVIEWS 16
+
+typedef struct zero_native_gtk_webview {
+    char *label;
+    WebKitWebView *web_view;
+    double x;
+    double y;
+    double width;
+    double height;
+    int layer;
+    int transparent;
+    int bridge_enabled;
+    WebKitUserContentManager *content_manager;
+} zero_native_gtk_webview_t;
 
 typedef struct zero_native_gtk_window {
     uint64_t id;
     GtkWindow *gtk_window;
     WebKitWebView *web_view;
+    GtkWidget *stack_root;
     WebKitUserContentManager *content_manager;
     struct zero_native_gtk_host *host;
     char *label;
@@ -23,6 +38,8 @@ typedef struct zero_native_gtk_window {
     int spa_fallback;
     double x;
     double y;
+    zero_native_gtk_webview_t webviews[ZERO_NATIVE_MAX_WEBVIEWS];
+    int webview_count;
 } zero_native_gtk_window_t;
 
 struct zero_native_gtk_host {
@@ -114,8 +131,75 @@ static void zero_native_clear_window_source(zero_native_gtk_window_t *win) {
     win->spa_fallback = 0;
 }
 
+static int zero_native_valid_webview_frame(double x, double y, double width, double height) {
+    return x >= 0 && y >= 0 && width > 0 && height > 0;
+}
+
+static int zero_native_webview_extent(double value) {
+    return value > 1 ? (int)(value + 0.5) : 1;
+}
+
+static int zero_native_webview_coord(double value) {
+    return value > 0 ? (int)(value + 0.5) : 0;
+}
+
+static void zero_native_apply_webview_frame(zero_native_gtk_webview_t *webview) {
+    if (!webview || !webview->web_view) return;
+    GtkWidget *widget = GTK_WIDGET(webview->web_view);
+    gtk_widget_set_halign(widget, GTK_ALIGN_START);
+    gtk_widget_set_valign(widget, GTK_ALIGN_START);
+    gtk_widget_set_margin_start(widget, zero_native_webview_coord(webview->x));
+    gtk_widget_set_margin_top(widget, zero_native_webview_coord(webview->y));
+    gtk_widget_set_size_request(widget, zero_native_webview_extent(webview->width), zero_native_webview_extent(webview->height));
+}
+
+static void zero_native_reorder_webviews(zero_native_gtk_window_t *win) {
+    if (!win || !win->stack_root) return;
+    int placed[ZERO_NATIVE_MAX_WEBVIEWS] = {0};
+    GtkWidget *previous = NULL;
+    for (int pass = 0; pass < win->webview_count; pass++) {
+        int best = -1;
+        for (int i = 0; i < win->webview_count; i++) {
+            if (!win->webviews[i].web_view) continue;
+            if (placed[i]) continue;
+            if (best < 0 || win->webviews[i].layer < win->webviews[best].layer) best = i;
+        }
+        if (best < 0) break;
+        gtk_widget_insert_after(GTK_WIDGET(win->webviews[best].web_view), GTK_WIDGET(win->stack_root), previous);
+        placed[best] = 1;
+        previous = GTK_WIDGET(win->webviews[best].web_view);
+    }
+}
+
+static void zero_native_clear_webview(zero_native_gtk_window_t *win, zero_native_gtk_webview_t *webview) {
+    if (!webview) return;
+    if (webview->web_view && win && win->stack_root) {
+        gtk_overlay_remove_overlay(GTK_OVERLAY(win->stack_root), GTK_WIDGET(webview->web_view));
+    }
+    free(webview->label);
+    memset(webview, 0, sizeof(*webview));
+}
+
+static void zero_native_remove_webview_at(zero_native_gtk_window_t *win, int index) {
+    if (!win || index < 0 || index >= win->webview_count) return;
+    zero_native_clear_webview(win, &win->webviews[index]);
+    for (int i = index; i + 1 < win->webview_count; i++) {
+        win->webviews[i] = win->webviews[i + 1];
+    }
+    memset(&win->webviews[win->webview_count - 1], 0, sizeof(win->webviews[win->webview_count - 1]));
+    win->webview_count--;
+}
+
+static void zero_native_clear_webviews(zero_native_gtk_window_t *win) {
+    if (!win) return;
+    while (win->webview_count > 0) {
+        zero_native_remove_webview_at(win, win->webview_count - 1);
+    }
+}
+
 static void zero_native_clear_window(zero_native_gtk_window_t *win) {
     if (!win) return;
+    zero_native_clear_webviews(win);
     zero_native_clear_window_source(win);
     free(win->label);
     free(win->title);
@@ -205,6 +289,14 @@ static const char *zero_native_bridge_script(void) {
         "});"
         "}"
         "function selector(value){return typeof value==='number'?{id:value}:{label:String(value)};}"
+        "function ensureString(value,name){if(typeof value!=='string'||value.length===0){throw new TypeError(name+' must be a non-empty string');}return value;}"
+        "function ensureNumber(value,name){if(typeof value!=='number'||!isFinite(value)){throw new TypeError(name+' must be a finite number');}return value;}"
+        "function validateWebViewSelector(options){if(options.label!=null){ensureString(options.label,'label');}if(options.windowId!=null&&(typeof options.windowId!=='number'||!isFinite(options.windowId)||options.windowId<0||Math.floor(options.windowId)!==options.windowId)){throw new TypeError('windowId must be a non-negative integer');}}"
+        "function framePayload(options){options=options||{};validateWebViewSelector(options);var frame=options.frame||options;return {label:options.label,windowId:options.windowId,url:options.url,frame:{x:frame.x==null?0:ensureNumber(frame.x,'frame.x'),y:frame.y==null?0:ensureNumber(frame.y,'frame.y'),width:ensureNumber(frame.width,'frame.width'),height:ensureNumber(frame.height,'frame.height')}};}"
+        "function createPayload(options){options=options||{};ensureString(options.url,'url');var payload=framePayload(options);if(options.layer!=null){payload.layer=ensureNumber(options.layer,'layer');}if(options.transparent!=null){payload.transparent=!!options.transparent;}if(options.bridge!=null){payload.bridge=!!options.bridge;}return payload;}"
+        "function navigatePayload(options){options=options||{};validateWebViewSelector(options);ensureString(options.url,'url');return {label:options.label,windowId:options.windowId,url:options.url};}"
+        "function closePayload(options){options=options||{};validateWebViewSelector(options);return {label:options.label,windowId:options.windowId};}"
+        "function webviewHandle(info){return Object.freeze(Object.assign({},info,{setFrame:function(frame){return webviews.setFrame({label:info.label,windowId:info.windowId,frame:frame});},navigate:function(url){return webviews.navigate({label:info.label,windowId:info.windowId,url:url});},setZoom:function(zoom){return webviews.setZoom({label:info.label,windowId:info.windowId,zoom:zoom});},setLayer:function(layer){return webviews.setLayer({label:info.label,windowId:info.windowId,layer:layer});},close:function(){return webviews.close({label:info.label,windowId:info.windowId});}}));}"
         "function on(name,callback){if(typeof callback!=='function'){throw new TypeError('callback must be a function');}var set=listeners.get(name);if(!set){set=new Set();listeners.set(name,set);}set.add(callback);return function(){off(name,callback);};}"
         "function off(name,callback){var set=listeners.get(name);if(set){set.delete(callback);if(set.size===0){listeners.delete(name);}}}"
         "function emit(name,detail){var set=listeners.get(name);if(set){Array.from(set).forEach(function(callback){callback(detail);});}window.dispatchEvent(new CustomEvent('zero-native:'+name,{detail:detail}));}"
@@ -219,7 +311,18 @@ static const char *zero_native_bridge_script(void) {
         "saveFile:function(options){return invoke('zero-native.dialog.saveFile',options||{});},"
         "showMessage:function(options){return invoke('zero-native.dialog.showMessage',options||{});}"
         "});"
-        "Object.defineProperty(window,'zero',{value:Object.freeze({invoke:invoke,on:on,off:off,windows:windows,dialogs:dialogs,_complete:complete,_emit:emit}),configurable:false});"
+        "function zoomPayload(options){options=options||{};validateWebViewSelector(options);return {label:options.label,windowId:options.windowId,zoom:ensureNumber(options.zoom,'zoom')};}"
+        "function layerPayload(options){options=options||{};validateWebViewSelector(options);return {label:options.label,windowId:options.windowId,layer:ensureNumber(options.layer,'layer')};}"
+        "var webviews=Object.freeze({"
+        "create:function(options){return invoke('zero-native.webview.create',createPayload(options)).then(webviewHandle);},"
+        "list:function(){return invoke('zero-native.webview.list',{});},"
+        "setFrame:function(options){return invoke('zero-native.webview.setFrame',framePayload(options));},"
+        "navigate:function(options){return invoke('zero-native.webview.navigate',navigatePayload(options));},"
+        "setZoom:function(options){return invoke('zero-native.webview.setZoom',zoomPayload(options));},"
+        "setLayer:function(options){return invoke('zero-native.webview.setLayer',layerPayload(options));},"
+        "close:function(options){return invoke('zero-native.webview.close',closePayload(options));}"
+        "});"
+        "Object.defineProperty(window,'zero',{value:Object.freeze({invoke:invoke,on:on,off:off,windows:windows,dialogs:dialogs,webviews:webviews,_complete:complete,_emit:emit}),configurable:false});"
         "})();";
 }
 
@@ -328,6 +431,14 @@ static zero_native_gtk_window_t *zero_native_find_window(zero_native_gtk_host_t 
     return NULL;
 }
 
+static zero_native_gtk_webview_t *zero_native_find_webview(zero_native_gtk_window_t *win, const char *label) {
+    if (!win || !label) return NULL;
+    for (int i = 0; i < win->webview_count; i++) {
+        if (win->webviews[i].label && strcmp(win->webviews[i].label, label) == 0) return &win->webviews[i];
+    }
+    return NULL;
+}
+
 static void zero_native_emit(zero_native_gtk_host_t *host, zero_native_gtk_event_t event) {
     if (host->callback) host->callback(host->callback_context, &event);
 }
@@ -404,11 +515,6 @@ static gboolean on_close_request(GtkWindow *window, gpointer data) {
 
     if (closed_index >= 0) {
         zero_native_clear_window(&host->windows[closed_index]);
-        for (int i = closed_index; i + 1 < host->window_count; i++) {
-            host->windows[i] = host->windows[i + 1];
-        }
-        memset(&host->windows[host->window_count - 1], 0, sizeof(host->windows[host->window_count - 1]));
-        host->window_count--;
     }
 
     int open_count = 0;
@@ -489,8 +595,30 @@ static gboolean on_decide_policy(WebKitWebView *web_view, WebKitPolicyDecision *
     return TRUE;
 }
 
+static gboolean on_webview_decide_policy(WebKitWebView *web_view, WebKitPolicyDecision *decision, WebKitPolicyDecisionType type, gpointer data) {
+    (void)web_view;
+    zero_native_gtk_window_t *win = data;
+    zero_native_gtk_host_t *host = win->host;
+    const char *uri = zero_native_decision_uri(decision, type);
+    if (!uri || !uri[0] || strncmp(uri, "about:", 6) == 0) {
+        webkit_policy_decision_use(decision);
+        return TRUE;
+    }
+    char *origin = zero_native_origin_for_uri(uri);
+    int internal_asset = win->asset_origin && strcmp(origin, win->asset_origin) == 0;
+    g_free(origin);
+    if (internal_asset || zero_native_policy_list_matches(host->allowed_origins, host->allowed_origins_count, uri)) {
+        webkit_policy_decision_use(decision);
+        return TRUE;
+    }
+    if (host->external_link_action == 1 && zero_native_policy_list_matches(host->allowed_external_urls, host->allowed_external_urls_count, uri)) {
+        zero_native_open_external_uri(win->gtk_window, uri);
+    }
+    webkit_policy_decision_ignore(decision);
+    return TRUE;
+}
+
 static void on_bridge_message(WebKitUserContentManager *manager, JSCValue *js_result, gpointer data) {
-    (void)manager;
     zero_native_gtk_window_t *win = data;
     zero_native_gtk_host_t *host = win->host;
     if (!host->bridge_callback) return;
@@ -498,9 +626,20 @@ static void on_bridge_message(WebKitUserContentManager *manager, JSCValue *js_re
     char *message = jsc_value_to_string(js_result);
     if (!message) return;
 
-    const char *uri = webkit_web_view_get_uri(win->web_view);
-    char *computed_origin = win->bridge_origin ? g_strdup(win->bridge_origin) : zero_native_origin_for_uri(uri);
-    host->bridge_callback(host->bridge_context, win->id, message, strlen(message), computed_origin, strlen(computed_origin));
+    const char *label = "main";
+    WebKitWebView *source_webview = win->web_view;
+    if (manager != win->content_manager) {
+        for (int i = 0; i < win->webview_count; i++) {
+            if (win->webviews[i].content_manager == manager) {
+                label = win->webviews[i].label ? win->webviews[i].label : "webview";
+                source_webview = win->webviews[i].web_view;
+                break;
+            }
+        }
+    }
+    const char *uri = webkit_web_view_get_uri(source_webview);
+    char *computed_origin = win->bridge_origin && strcmp(label, "main") == 0 ? g_strdup(win->bridge_origin) : zero_native_origin_for_uri(uri);
+    host->bridge_callback(host->bridge_context, win->id, label, strlen(label), message, strlen(message), computed_origin, strlen(computed_origin));
     g_free(computed_origin);
     g_free(message);
 }
@@ -520,10 +659,21 @@ static void zero_native_setup_bridge(zero_native_gtk_window_t *win) {
 }
 
 static zero_native_gtk_window_t *zero_native_create_window_internal(zero_native_gtk_host_t *host, uint64_t window_id, const char *title, const char *label, double x, double y, double width, double height, int restore_frame) {
-    if (host->window_count >= ZERO_NATIVE_MAX_WINDOWS) return NULL;
     if (zero_native_find_window(host, window_id)) return NULL;
 
-    zero_native_gtk_window_t *win = &host->windows[host->window_count];
+    int slot = -1;
+    for (int i = 0; i < host->window_count; i++) {
+        if (!host->windows[i].gtk_window) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        if (host->window_count >= ZERO_NATIVE_MAX_WINDOWS) return NULL;
+        slot = host->window_count++;
+    }
+
+    zero_native_gtk_window_t *win = &host->windows[slot];
     memset(win, 0, sizeof(*win));
     win->id = window_id;
     win->host = host;
@@ -554,7 +704,9 @@ static zero_native_gtk_window_t *zero_native_create_window_internal(zero_native_
     }
     zero_native_setup_bridge(win);
 
-    gtk_window_set_child(win->gtk_window, GTK_WIDGET(wv));
+    win->stack_root = gtk_overlay_new();
+    gtk_overlay_set_child(GTK_OVERLAY(win->stack_root), GTK_WIDGET(wv));
+    gtk_window_set_child(win->gtk_window, win->stack_root);
 
     g_signal_connect(win->gtk_window, "notify::default-width", G_CALLBACK(on_resize), win);
     g_signal_connect(win->gtk_window, "notify::default-height", G_CALLBACK(on_resize), win);
@@ -562,7 +714,6 @@ static zero_native_gtk_window_t *zero_native_create_window_internal(zero_native_
     g_signal_connect(win->gtk_window, "close-request", G_CALLBACK(on_close_request), win);
     g_signal_connect(win->web_view, "decide-policy", G_CALLBACK(on_decide_policy), win);
 
-    host->window_count++;
     return win;
 }
 
@@ -624,9 +775,7 @@ void zero_native_gtk_destroy(zero_native_gtk_host_t *host) {
     if (!host) return;
     if (host->frame_timer) g_source_remove(host->frame_timer);
     for (int i = 0; i < host->window_count; i++) {
-        zero_native_clear_window_source(&host->windows[i]);
-        free(host->windows[i].label);
-        free(host->windows[i].title);
+        zero_native_clear_window(&host->windows[i]);
     }
     g_object_unref(host->app);
     free(host->app_name);
@@ -717,8 +866,23 @@ void zero_native_gtk_bridge_respond(zero_native_gtk_host_t *host, const char *re
 }
 
 void zero_native_gtk_bridge_respond_window(zero_native_gtk_host_t *host, uint64_t window_id, const char *response, size_t response_len) {
+    zero_native_gtk_bridge_respond_webview(host, window_id, "main", 4, response, response_len);
+}
+
+void zero_native_gtk_bridge_respond_webview(zero_native_gtk_host_t *host, uint64_t window_id, const char *webview_label, size_t webview_label_len, const char *response, size_t response_len) {
     zero_native_gtk_window_t *win = zero_native_find_window(host, window_id);
     if (!win || !win->web_view) return;
+    char *label = webview_label_len > 0 ? zero_native_strndup(webview_label, webview_label_len) : zero_native_strndup("main", 4);
+    if (!label) return;
+    WebKitWebView *target = NULL;
+    if (strcmp(label, "main") == 0) {
+        target = win->web_view;
+    } else {
+        zero_native_gtk_webview_t *webview = zero_native_find_webview(win, label);
+        if (webview) target = webview->web_view;
+    }
+    free(label);
+    if (!target) return;
 
     char *resp = zero_native_strndup(response, response_len);
     if (!resp) return;
@@ -732,7 +896,7 @@ void zero_native_gtk_bridge_respond_window(zero_native_gtk_host_t *host, uint64_
         memcpy(script + prefix_len, resp, response_len);
         memcpy(script + prefix_len + response_len, ");", suffix_len);
         script[script_len] = '\0';
-        webkit_web_view_evaluate_javascript(win->web_view, script, -1, NULL, NULL, NULL, NULL, NULL);
+        webkit_web_view_evaluate_javascript(target, script, -1, NULL, NULL, NULL, NULL, NULL);
         free(script);
     }
     free(resp);
@@ -796,6 +960,160 @@ int zero_native_gtk_close_window(zero_native_gtk_host_t *host, uint64_t window_i
     if (!win || !win->gtk_window) return 0;
     gtk_window_close(win->gtk_window);
     return 1;
+}
+
+int zero_native_gtk_create_webview(zero_native_gtk_host_t *host, uint64_t window_id, const char *label, size_t label_len, const char *url, size_t url_len, double x, double y, double width, double height, int layer, int transparent, int bridge_enabled) {
+    zero_native_gtk_window_t *win = zero_native_find_window(host, window_id);
+    if (!win || !win->stack_root || label_len == 0 || url_len == 0 || !zero_native_valid_webview_frame(x, y, width, height)) return 0;
+    if (win->webview_count >= ZERO_NATIVE_MAX_WEBVIEWS) return 0;
+
+    char *label_copy = zero_native_strndup(label, label_len);
+    char *url_copy = zero_native_strndup(url, url_len);
+    if (!label_copy || !url_copy) {
+        free(label_copy);
+        free(url_copy);
+        return 0;
+    }
+    if (zero_native_find_webview(win, label_copy) || !zero_native_policy_list_matches(host->allowed_origins, host->allowed_origins_count, url_copy)) {
+        free(label_copy);
+        free(url_copy);
+        return 0;
+    }
+
+    WebKitUserContentManager *manager = webkit_user_content_manager_new();
+    if (bridge_enabled) {
+        g_signal_connect(manager, "script-message-received::zeroNativeBridge", G_CALLBACK(on_bridge_message), win);
+        webkit_user_content_manager_register_script_message_handler(manager, "zeroNativeBridge", NULL);
+        WebKitUserScript *script = webkit_user_script_new(
+            zero_native_bridge_script(),
+            WEBKIT_USER_CONTENT_INJECT_TOP_FRAME,
+            WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START,
+            NULL, NULL);
+        webkit_user_content_manager_add_script(manager, script);
+        webkit_user_script_unref(script);
+    }
+    WebKitWebView *web_view = WEBKIT_WEB_VIEW(
+        g_object_new(WEBKIT_TYPE_WEB_VIEW,
+            "user-content-manager", manager,
+            NULL));
+    g_object_unref(manager);
+    if (!web_view) {
+        free(label_copy);
+        free(url_copy);
+        return 0;
+    }
+
+    zero_native_gtk_webview_t *webview = &win->webviews[win->webview_count++];
+    memset(webview, 0, sizeof(*webview));
+    webview->label = label_copy;
+    webview->web_view = web_view;
+    webview->x = x;
+    webview->y = y;
+    webview->width = width;
+    webview->height = height;
+    webview->layer = layer;
+    webview->transparent = transparent != 0;
+    webview->bridge_enabled = bridge_enabled != 0;
+    webview->content_manager = manager;
+    zero_native_apply_webview_frame(webview);
+    gtk_overlay_add_overlay(GTK_OVERLAY(win->stack_root), GTK_WIDGET(web_view));
+    if (transparent) {
+        GdkRGBA transparent_color = {0, 0, 0, 0};
+        webkit_web_view_set_background_color(web_view, &transparent_color);
+    }
+    zero_native_reorder_webviews(win);
+    g_signal_connect(web_view, "decide-policy", G_CALLBACK(on_webview_decide_policy), win);
+    webkit_web_view_load_uri(web_view, url_copy);
+    free(url_copy);
+    return 1;
+}
+
+int zero_native_gtk_set_webview_frame(zero_native_gtk_host_t *host, uint64_t window_id, const char *label, size_t label_len, double x, double y, double width, double height) {
+    zero_native_gtk_window_t *win = zero_native_find_window(host, window_id);
+    char *label_copy = label_len > 0 ? zero_native_strndup(label, label_len) : NULL;
+    if (label_copy && strcmp(label_copy, "main") == 0 && win && win->web_view && zero_native_valid_webview_frame(x, y, width, height)) {
+        GtkWidget *widget = GTK_WIDGET(win->web_view);
+        gtk_widget_set_halign(widget, GTK_ALIGN_START);
+        gtk_widget_set_valign(widget, GTK_ALIGN_START);
+        gtk_widget_set_margin_start(widget, zero_native_webview_coord(x));
+        gtk_widget_set_margin_top(widget, zero_native_webview_coord(y));
+        gtk_widget_set_size_request(widget, zero_native_webview_extent(width), zero_native_webview_extent(height));
+        free(label_copy);
+        return 1;
+    }
+    zero_native_gtk_webview_t *webview = zero_native_find_webview(win, label_copy);
+    free(label_copy);
+    if (!webview || !zero_native_valid_webview_frame(x, y, width, height)) return 0;
+    webview->x = x;
+    webview->y = y;
+    webview->width = width;
+    webview->height = height;
+    zero_native_apply_webview_frame(webview);
+    return 1;
+}
+
+int zero_native_gtk_navigate_webview(zero_native_gtk_host_t *host, uint64_t window_id, const char *label, size_t label_len, const char *url, size_t url_len) {
+    zero_native_gtk_window_t *win = zero_native_find_window(host, window_id);
+    char *label_copy = label_len > 0 ? zero_native_strndup(label, label_len) : NULL;
+    char *url_copy = url_len > 0 ? zero_native_strndup(url, url_len) : NULL;
+    zero_native_gtk_webview_t *webview = zero_native_find_webview(win, label_copy);
+    if (!webview || !url_copy || !zero_native_policy_list_matches(host->allowed_origins, host->allowed_origins_count, url_copy)) {
+        free(label_copy);
+        free(url_copy);
+        return 0;
+    }
+    webkit_web_view_load_uri(webview->web_view, url_copy);
+    free(label_copy);
+    free(url_copy);
+    return 1;
+}
+
+int zero_native_gtk_set_webview_zoom(zero_native_gtk_host_t *host, uint64_t window_id, const char *label, size_t label_len, double zoom) {
+    zero_native_gtk_window_t *win = zero_native_find_window(host, window_id);
+    char *label_copy = label_len > 0 ? zero_native_strndup(label, label_len) : NULL;
+    if (label_copy && strcmp(label_copy, "main") == 0 && win && win->web_view && zoom >= 0.25 && zoom <= 5.0) {
+        webkit_web_view_set_zoom_level(win->web_view, zoom);
+        free(label_copy);
+        return 1;
+    }
+    zero_native_gtk_webview_t *webview = zero_native_find_webview(win, label_copy);
+    free(label_copy);
+    if (!webview || !webview->web_view || zoom < 0.25 || zoom > 5.0) return 0;
+    webkit_web_view_set_zoom_level(webview->web_view, zoom);
+    return 1;
+}
+
+int zero_native_gtk_set_webview_layer(zero_native_gtk_host_t *host, uint64_t window_id, const char *label, size_t label_len, int layer) {
+    zero_native_gtk_window_t *win = zero_native_find_window(host, window_id);
+    char *label_copy = label_len > 0 ? zero_native_strndup(label, label_len) : NULL;
+    if (label_copy && strcmp(label_copy, "main") == 0 && win && win->web_view) {
+        free(label_copy);
+        return 0;
+    }
+    zero_native_gtk_webview_t *webview = zero_native_find_webview(win, label_copy);
+    free(label_copy);
+    if (!webview || !webview->web_view) return 0;
+    webview->layer = layer;
+    zero_native_reorder_webviews(win);
+    return 1;
+}
+
+int zero_native_gtk_close_webview(zero_native_gtk_host_t *host, uint64_t window_id, const char *label, size_t label_len) {
+    zero_native_gtk_window_t *win = zero_native_find_window(host, window_id);
+    char *label_copy = label_len > 0 ? zero_native_strndup(label, label_len) : NULL;
+    if (!win || !label_copy) {
+        free(label_copy);
+        return 0;
+    }
+    for (int i = 0; i < win->webview_count; i++) {
+        if (win->webviews[i].label && strcmp(win->webviews[i].label, label_copy) == 0) {
+            free(label_copy);
+            zero_native_remove_webview_at(win, i);
+            return 1;
+        }
+    }
+    free(label_copy);
+    return 0;
 }
 
 typedef struct zero_native_clipboard_read_state {

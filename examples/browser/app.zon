@@ -1,0 +1,18 @@
+.{
+    .id = "dev.zero_native.browser",
+    .name = "browser",
+    .display_name = "Browser Example",
+    .version = "0.1.0",
+    .icons = .{ "assets/icon.icns" },
+    .platforms = .{ "macos", "linux" },
+    .permissions = .{ "window" },
+    .capabilities = .{ "webview", "js_bridge" },
+    .security = .{
+        .navigation = .{
+            .allowed_origins = .{ "*" },
+            .external_links = .{ .action = "deny" },
+        },
+    },
+    .web_engine = "system",
+    .cef = .{ .dir = "third_party/cef/macos", .auto_install = false },
+}

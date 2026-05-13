@@ -1,3 +1,4 @@
+const std = @import("std");
 const geometry = @import("geometry");
 const platform_mod = @import("../root.zig");
 const policy_values = @import("../policy_values.zig");
@@ -37,7 +38,7 @@ const GtkEvent = extern struct {
 };
 
 const GtkCallback = *const fn (context: ?*anyopaque, event: *const GtkEvent) callconv(.c) void;
-const GtkBridgeCallback = *const fn (context: ?*anyopaque, window_id: u64, message: [*]const u8, message_len: usize, origin: [*]const u8, origin_len: usize) callconv(.c) void;
+const GtkBridgeCallback = *const fn (context: ?*anyopaque, window_id: u64, webview_label: [*]const u8, webview_label_len: usize, message: [*]const u8, message_len: usize, origin: [*]const u8, origin_len: usize) callconv(.c) void;
 
 extern fn zero_native_gtk_create(app_name: [*]const u8, app_name_len: usize, window_title: [*]const u8, window_title_len: usize, bundle_id: [*]const u8, bundle_id_len: usize, icon_path: [*]const u8, icon_path_len: usize, window_label: [*]const u8, window_label_len: usize, x: f64, y: f64, width: f64, height: f64, restore_frame: c_int) ?*GtkHost;
 extern fn zero_native_gtk_destroy(host: *GtkHost) void;
@@ -48,11 +49,18 @@ extern fn zero_native_gtk_load_window_webview(host: *GtkHost, window_id: u64, so
 extern fn zero_native_gtk_set_bridge_callback(host: *GtkHost, callback: GtkBridgeCallback, context: ?*anyopaque) void;
 extern fn zero_native_gtk_bridge_respond(host: *GtkHost, response: [*]const u8, response_len: usize) void;
 extern fn zero_native_gtk_bridge_respond_window(host: *GtkHost, window_id: u64, response: [*]const u8, response_len: usize) void;
+extern fn zero_native_gtk_bridge_respond_webview(host: *GtkHost, window_id: u64, webview_label: [*]const u8, webview_label_len: usize, response: [*]const u8, response_len: usize) void;
 extern fn zero_native_gtk_emit_window_event(host: *GtkHost, window_id: u64, name: [*]const u8, name_len: usize, detail_json: [*]const u8, detail_json_len: usize) void;
 extern fn zero_native_gtk_set_security_policy(host: *GtkHost, allowed_origins: [*]const u8, allowed_origins_len: usize, external_urls: [*]const u8, external_urls_len: usize, external_action: c_int) void;
 extern fn zero_native_gtk_create_window(host: *GtkHost, window_id: u64, window_title: [*]const u8, window_title_len: usize, window_label: [*]const u8, window_label_len: usize, x: f64, y: f64, width: f64, height: f64, restore_frame: c_int) c_int;
 extern fn zero_native_gtk_focus_window(host: *GtkHost, window_id: u64) c_int;
 extern fn zero_native_gtk_close_window(host: *GtkHost, window_id: u64) c_int;
+extern fn zero_native_gtk_create_webview(host: *GtkHost, window_id: u64, label: [*]const u8, label_len: usize, url: [*]const u8, url_len: usize, x: f64, y: f64, width: f64, height: f64, layer: c_int, transparent: c_int, bridge_enabled: c_int) c_int;
+extern fn zero_native_gtk_set_webview_frame(host: *GtkHost, window_id: u64, label: [*]const u8, label_len: usize, x: f64, y: f64, width: f64, height: f64) c_int;
+extern fn zero_native_gtk_navigate_webview(host: *GtkHost, window_id: u64, label: [*]const u8, label_len: usize, url: [*]const u8, url_len: usize) c_int;
+extern fn zero_native_gtk_set_webview_zoom(host: *GtkHost, window_id: u64, label: [*]const u8, label_len: usize, zoom: f64) c_int;
+extern fn zero_native_gtk_set_webview_layer(host: *GtkHost, window_id: u64, label: [*]const u8, label_len: usize, layer: c_int) c_int;
+extern fn zero_native_gtk_close_webview(host: *GtkHost, window_id: u64, label: [*]const u8, label_len: usize) c_int;
 extern fn zero_native_gtk_clipboard_read(host: *GtkHost, buffer: [*]u8, buffer_len: usize) usize;
 extern fn zero_native_gtk_clipboard_write(host: *GtkHost, text: [*]const u8, text_len: usize) void;
 
@@ -153,9 +161,16 @@ pub const LinuxPlatform = struct {
                 .load_window_webview_fn = loadWindowWebView,
                 .complete_bridge_fn = completeBridge,
                 .complete_window_bridge_fn = completeWindowBridge,
+                .complete_webview_bridge_fn = completeWebViewBridge,
                 .create_window_fn = createWindow,
                 .focus_window_fn = focusWindow,
                 .close_window_fn = closeWindow,
+                .create_webview_fn = createWebView,
+                .set_webview_frame_fn = setWebViewFrame,
+                .navigate_webview_fn = navigateWebView,
+                .set_webview_zoom_fn = setWebViewZoom,
+                .set_webview_layer_fn = setWebViewLayer,
+                .close_webview_fn = closeWebView,
                 .show_open_dialog_fn = showOpenDialog,
                 .show_save_dialog_fn = showSaveDialog,
                 .show_message_dialog_fn = showMessageDialog,
@@ -242,12 +257,13 @@ fn gtkCallback(context: ?*anyopaque, event: *const GtkEvent) callconv(.c) void {
     }
 }
 
-fn gtkBridgeCallback(context: ?*anyopaque, window_id: u64, message: [*]const u8, message_len: usize, origin: [*]const u8, origin_len: usize) callconv(.c) void {
+fn gtkBridgeCallback(context: ?*anyopaque, window_id: u64, webview_label: [*]const u8, webview_label_len: usize, message: [*]const u8, message_len: usize, origin: [*]const u8, origin_len: usize) callconv(.c) void {
     const state: *RunState = @ptrCast(@alignCast(context.?));
     state.emit(.{ .bridge_message = .{
         .bytes = message[0..message_len],
         .origin = origin[0..origin_len],
         .window_id = window_id,
+        .webview_label = webview_label[0..webview_label_len],
     } });
 }
 
@@ -298,6 +314,11 @@ fn completeWindowBridge(context: ?*anyopaque, window_id: platform_mod.WindowId, 
     zero_native_gtk_bridge_respond_window(self.host, window_id, response.ptr, response.len);
 }
 
+fn completeWebViewBridge(context: ?*anyopaque, window_id: platform_mod.WindowId, webview_label: []const u8, response: []const u8) anyerror!void {
+    const self: *LinuxPlatform = @ptrCast(@alignCast(context.?));
+    zero_native_gtk_bridge_respond_webview(self.host, window_id, webview_label.ptr, webview_label.len, response.ptr, response.len);
+}
+
 fn emitWindowEvent(context: ?*anyopaque, window_id: platform_mod.WindowId, name: []const u8, detail_json: []const u8) anyerror!void {
     const self: *LinuxPlatform = @ptrCast(@alignCast(context.?));
     zero_native_gtk_emit_window_event(self.host, window_id, name.ptr, name.len, detail_json.ptr, detail_json.len);
@@ -327,6 +348,56 @@ fn focusWindow(context: ?*anyopaque, window_id: platform_mod.WindowId) anyerror!
 fn closeWindow(context: ?*anyopaque, window_id: platform_mod.WindowId) anyerror!void {
     const self: *LinuxPlatform = @ptrCast(@alignCast(context.?));
     if (zero_native_gtk_close_window(self.host, window_id) == 0) return error.CloseFailed;
+}
+
+fn createWebView(context: ?*anyopaque, options: platform_mod.WebViewOptions) anyerror!void {
+    const self: *LinuxPlatform = @ptrCast(@alignCast(context.?));
+    if (self.web_engine == .chromium) return error.UnsupportedChildWebViews;
+    const frame = options.frame;
+    if (zero_native_gtk_create_webview(self.host, options.window_id, options.label.ptr, options.label.len, options.url.ptr, options.url.len, frame.x, frame.y, frame.width, frame.height, options.layer, if (options.transparent) 1 else 0, if (options.bridge_enabled) 1 else 0) == 0) return error.CreateFailed;
+}
+
+fn setWebViewFrame(context: ?*anyopaque, window_id: platform_mod.WindowId, label: []const u8, frame: geometry.RectF) anyerror!void {
+    const self: *LinuxPlatform = @ptrCast(@alignCast(context.?));
+    if (self.web_engine == .chromium) {
+        if (std.mem.eql(u8, label, "main")) return error.UnsupportedMainWebViewFrame;
+        return error.UnsupportedChildWebViews;
+    }
+    if (zero_native_gtk_set_webview_frame(self.host, window_id, label.ptr, label.len, frame.x, frame.y, frame.width, frame.height) == 0) return error.WebViewNotFound;
+}
+
+fn navigateWebView(context: ?*anyopaque, window_id: platform_mod.WindowId, label: []const u8, url: []const u8) anyerror!void {
+    const self: *LinuxPlatform = @ptrCast(@alignCast(context.?));
+    if (self.web_engine == .chromium) {
+        if (std.mem.eql(u8, label, "main")) return error.InvalidWebViewOptions;
+        return error.UnsupportedChildWebViews;
+    }
+    if (zero_native_gtk_navigate_webview(self.host, window_id, label.ptr, label.len, url.ptr, url.len) == 0) return error.WebViewNotFound;
+}
+
+fn setWebViewZoom(context: ?*anyopaque, window_id: platform_mod.WindowId, label: []const u8, zoom: f64) anyerror!void {
+    const self: *LinuxPlatform = @ptrCast(@alignCast(context.?));
+    if (self.web_engine == .chromium) {
+        if (std.mem.eql(u8, label, "main")) return error.UnsupportedMainWebViewZoom;
+        return error.UnsupportedChildWebViews;
+    }
+    if (zero_native_gtk_set_webview_zoom(self.host, window_id, label.ptr, label.len, zoom) == 0) return error.WebViewNotFound;
+}
+
+fn setWebViewLayer(context: ?*anyopaque, window_id: platform_mod.WindowId, label: []const u8, layer: i32) anyerror!void {
+    const self: *LinuxPlatform = @ptrCast(@alignCast(context.?));
+    if (std.mem.eql(u8, label, "main")) return error.UnsupportedMainWebViewLayer;
+    if (self.web_engine == .chromium) return error.UnsupportedChildWebViews;
+    if (zero_native_gtk_set_webview_layer(self.host, window_id, label.ptr, label.len, layer) == 0) return error.WebViewNotFound;
+}
+
+fn closeWebView(context: ?*anyopaque, window_id: platform_mod.WindowId, label: []const u8) anyerror!void {
+    const self: *LinuxPlatform = @ptrCast(@alignCast(context.?));
+    if (self.web_engine == .chromium) {
+        if (std.mem.eql(u8, label, "main")) return error.InvalidWebViewOptions;
+        return error.UnsupportedChildWebViews;
+    }
+    if (zero_native_gtk_close_webview(self.host, window_id, label.ptr, label.len) == 0) return error.WebViewNotFound;
 }
 
 fn showOpenDialog(context: ?*anyopaque, options: platform_mod.OpenDialogOptions, buffer: []u8) anyerror!platform_mod.OpenDialogResult {

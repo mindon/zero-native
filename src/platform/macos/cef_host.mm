@@ -15,8 +15,10 @@
 #include "include/cef_application_mac.h"
 #include "include/cef_load_handler.h"
 #include "include/cef_process_message.h"
+#include "include/cef_values.h"
 #include "include/cef_v8.h"
 #include "include/wrapper/cef_library_loader.h"
+#include <math.h>
 #include <map>
 
 #ifndef ZERO_NATIVE_CEF_DIR
@@ -32,6 +34,7 @@
 namespace {
 
 static const char *kBridgeMessageName = "zero_native_bridge";
+static const char *kBridgeEnabledExtraInfo = "zeroNativeBridgeEnabled";
 static const char *ZeroNativeCefBridgeScript();
 static NSRect ZeroNativeConstrainFrame(NSRect frame);
 static NSString *ZeroNativeResolvedAssetRoot(NSString *rootPath);
@@ -65,6 +68,7 @@ private:
 class ZeroNativeCefClient final : public CefClient, public CefLifeSpanHandler, public CefLoadHandler, public CefRequestHandler {
 public:
     explicit ZeroNativeCefClient(ZeroNativeChromiumHost *host, uint64_t window_id) : host_(host), window_id_(window_id) {}
+    ZeroNativeCefClient(ZeroNativeChromiumHost *host, uint64_t window_id, std::string webview_key, uint64_t webview_generation, bool bridge_enabled) : host_(host), window_id_(window_id), webview_key_(webview_key), webview_generation_(webview_generation), bridge_enabled_(bridge_enabled) {}
 
     CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override {
         return this;
@@ -79,13 +83,22 @@ public:
     }
 
     void OnAfterCreated(CefRefPtr<CefBrowser> browser) override;
+    void OnBeforeClose(CefRefPtr<CefBrowser> browser) override;
     void OnLoadError(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, ErrorCode errorCode, const CefString& errorText, const CefString& failedUrl) override;
     bool OnBeforeBrowse(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, CefRefPtr<CefRequest> request, bool user_gesture, bool is_redirect) override;
     bool OnProcessMessageReceived(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, CefProcessId source_process, CefRefPtr<CefProcessMessage> message) override;
+    std::string WebViewLabel() const {
+        if (webview_key_.empty()) return "main";
+        size_t separator = webview_key_.find(':');
+        return separator == std::string::npos ? webview_key_ : webview_key_.substr(separator + 1);
+    }
 
 private:
     ZeroNativeChromiumHost *host_;
     uint64_t window_id_;
+    std::string webview_key_;
+    uint64_t webview_generation_ = 0;
+    bool bridge_enabled_ = true;
     IMPLEMENT_REFCOUNTING(ZeroNativeCefClient);
 };
 
@@ -103,9 +116,24 @@ public:
         return this;
     }
 
+    void OnBrowserCreated(CefRefPtr<CefBrowser> browser, CefRefPtr<CefDictionaryValue> extra_info) override {
+        if (!browser) return;
+        bool bridge_enabled = false;
+        if (extra_info && extra_info->HasKey(kBridgeEnabledExtraInfo)) {
+            bridge_enabled = extra_info->GetBool(kBridgeEnabledExtraInfo);
+        }
+        bridge_enabled_by_browser_id_[browser->GetIdentifier()] = bridge_enabled;
+    }
+
+    void OnBrowserDestroyed(CefRefPtr<CefBrowser> browser) override {
+        if (!browser) return;
+        bridge_enabled_by_browser_id_.erase(browser->GetIdentifier());
+    }
+
     void OnContextCreated(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, CefRefPtr<CefV8Context> context) override {
-        (void)browser;
         if (!frame || !frame->IsMain()) return;
+        const auto found = browser ? bridge_enabled_by_browser_id_.find(browser->GetIdentifier()) : bridge_enabled_by_browser_id_.end();
+        if (found == bridge_enabled_by_browser_id_.end() || !found->second) return;
         CefRefPtr<CefV8Value> bridge = CefV8Value::CreateObject(nullptr, nullptr);
         bridge->SetValue("postMessage", CefV8Value::CreateFunction("postMessage", new ZeroNativeCefBridgeV8Handler()), V8_PROPERTY_ATTRIBUTE_READONLY);
         context->GetGlobal()->SetValue("zeroNativeCefBridge", bridge, V8_PROPERTY_ATTRIBUTE_READONLY);
@@ -113,8 +141,15 @@ public:
     }
 
 private:
+    std::map<int, bool> bridge_enabled_by_browser_id_;
     IMPLEMENT_REFCOUNTING(ZeroNativeCefApp);
 };
+
+static CefRefPtr<CefDictionaryValue> ZeroNativeCefExtraInfo(bool bridge_enabled) {
+    CefRefPtr<CefDictionaryValue> extra_info = CefDictionaryValue::Create();
+    extra_info->SetBool(kBridgeEnabledExtraInfo, bridge_enabled);
+    return extra_info;
+}
 
 static bool g_cef_initialized = false;
 static bool g_cef_shutdown = false;
@@ -268,6 +303,14 @@ static const char *ZeroNativeCefBridgeScript() {
         "});"
         "}"
         "function selector(value){return typeof value==='number'?{id:value}:{label:String(value)};}"
+        "function ensureString(value,name){if(typeof value!=='string'||value.length===0){throw new TypeError(name+' must be a non-empty string');}return value;}"
+        "function ensureNumber(value,name){if(typeof value!=='number'||!isFinite(value)){throw new TypeError(name+' must be a finite number');}return value;}"
+        "function validateWebViewSelector(options){if(options.label!=null){ensureString(options.label,'label');}if(options.windowId!=null&&(typeof options.windowId!=='number'||!isFinite(options.windowId)||options.windowId<0||Math.floor(options.windowId)!==options.windowId)){throw new TypeError('windowId must be a non-negative integer');}}"
+        "function framePayload(options){options=options||{};validateWebViewSelector(options);var frame=options.frame||options;return {label:options.label,windowId:options.windowId,url:options.url,frame:{x:frame.x==null?0:ensureNumber(frame.x,'frame.x'),y:frame.y==null?0:ensureNumber(frame.y,'frame.y'),width:ensureNumber(frame.width,'frame.width'),height:ensureNumber(frame.height,'frame.height')}};}"
+        "function createPayload(options){options=options||{};ensureString(options.url,'url');var payload=framePayload(options);if(options.layer!=null){payload.layer=ensureNumber(options.layer,'layer');}if(options.transparent!=null){payload.transparent=!!options.transparent;}if(options.bridge!=null){payload.bridge=!!options.bridge;}return payload;}"
+        "function navigatePayload(options){options=options||{};validateWebViewSelector(options);ensureString(options.url,'url');return {label:options.label,windowId:options.windowId,url:options.url};}"
+        "function closePayload(options){options=options||{};validateWebViewSelector(options);return {label:options.label,windowId:options.windowId};}"
+        "function webviewHandle(info){return Object.freeze(Object.assign({},info,{setFrame:function(frame){return webviews.setFrame({label:info.label,windowId:info.windowId,frame:frame});},navigate:function(url){return webviews.navigate({label:info.label,windowId:info.windowId,url:url});},setZoom:function(zoom){return webviews.setZoom({label:info.label,windowId:info.windowId,zoom:zoom});},setLayer:function(layer){return webviews.setLayer({label:info.label,windowId:info.windowId,layer:layer});},close:function(){return webviews.close({label:info.label,windowId:info.windowId});}}));}"
         "function on(name,callback){if(typeof callback!=='function'){throw new TypeError('callback must be a function');}var set=listeners.get(name);if(!set){set=new Set();listeners.set(name,set);}set.add(callback);return function(){off(name,callback);};}"
         "function off(name,callback){var set=listeners.get(name);if(set){set.delete(callback);if(set.size===0){listeners.delete(name);}}}"
         "function emit(name,detail){var set=listeners.get(name);if(set){Array.from(set).forEach(function(callback){callback(detail);});}window.dispatchEvent(new CustomEvent('zero-native:'+name,{detail:detail}));}"
@@ -282,7 +325,18 @@ static const char *ZeroNativeCefBridgeScript() {
         "saveFile:function(options){return invoke('zero-native.dialog.saveFile',options||{});},"
         "showMessage:function(options){return invoke('zero-native.dialog.showMessage',options||{});}"
         "});"
-        "Object.defineProperty(window,'zero',{value:Object.freeze({invoke:invoke,on:on,off:off,windows:windows,dialogs:dialogs,_complete:complete,_emit:emit}),configurable:false});"
+        "function zoomPayload(options){options=options||{};validateWebViewSelector(options);return {label:options.label,windowId:options.windowId,zoom:ensureNumber(options.zoom,'zoom')};}"
+        "function layerPayload(options){options=options||{};validateWebViewSelector(options);return {label:options.label,windowId:options.windowId,layer:ensureNumber(options.layer,'layer')};}"
+        "var webviews=Object.freeze({"
+        "create:function(options){return invoke('zero-native.webview.create',createPayload(options)).then(webviewHandle);},"
+        "list:function(){return invoke('zero-native.webview.list',{});},"
+        "setFrame:function(options){return invoke('zero-native.webview.setFrame',framePayload(options));},"
+        "navigate:function(options){return invoke('zero-native.webview.navigate',navigatePayload(options));},"
+        "setZoom:function(options){return invoke('zero-native.webview.setZoom',zoomPayload(options));},"
+        "setLayer:function(options){return invoke('zero-native.webview.setLayer',layerPayload(options));},"
+        "close:function(options){return invoke('zero-native.webview.close',closePayload(options));}"
+        "});"
+        "Object.defineProperty(window,'zero',{value:Object.freeze({invoke:invoke,on:on,off:off,windows:windows,dialogs:dialogs,webviews:webviews,_complete:complete,_emit:emit}),configurable:false});"
         "})();";
 }
 
@@ -321,6 +375,12 @@ static const char *ZeroNativeCefBridgeScript() {
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSString *> *internalURLPrefixes;
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSString *> *windowLabels;
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSString *> *fallbackURLs;
+@property(nonatomic, strong) NSMutableDictionary<NSString *, NSView *> *webviewViews;
+@property(nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *webviewPendingURLs;
+@property(nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *webviewPendingZooms;
+@property(nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *webviewGenerations;
+@property(nonatomic, strong) NSMutableSet<NSString *> *closingWebViewKeys;
+@property(nonatomic, assign) uint64_t nextWebViewGeneration;
 @property(nonatomic, strong) NSTimer *timer;
 @property(nonatomic, strong) NSString *appName;
 @property(nonatomic, assign) zero_native_appkit_event_callback_t callback;
@@ -335,6 +395,8 @@ static const char *ZeroNativeCefBridgeScript() {
 @property(nonatomic) CefRefPtr<CefBrowser> browser;
 @property(nonatomic, assign) std::map<uint64_t, CefRefPtr<ZeroNativeCefClient>> *cefClients;
 @property(nonatomic, assign) std::map<uint64_t, CefRefPtr<CefBrowser>> *browsers;
+@property(nonatomic, assign) std::map<std::string, CefRefPtr<ZeroNativeCefClient>> *webviewCefClients;
+@property(nonatomic, assign) std::map<std::string, CefRefPtr<CefBrowser>> *webviewBrowsers;
 @property(nonatomic, strong) NSArray<NSString *> *allowedNavigationOrigins;
 @property(nonatomic, strong) NSArray<NSString *> *allowedExternalURLs;
 @property(nonatomic, assign) NSInteger externalLinkAction;
@@ -359,12 +421,26 @@ static const char *ZeroNativeCefBridgeScript() {
 - (BOOL)isInternalURL:(NSURL *)url;
 - (BOOL)allowsNavigationURL:(NSURL *)url;
 - (BOOL)openExternalURLIfAllowed:(NSURL *)url;
+- (BOOL)createWebViewInWindow:(uint64_t)windowId label:(NSString *)label url:(NSString *)url x:(double)x y:(double)y width:(double)width height:(double)height layer:(NSInteger)layer transparent:(BOOL)transparent bridgeEnabled:(BOOL)bridgeEnabled;
+- (BOOL)setWebViewFrameInWindow:(uint64_t)windowId label:(NSString *)label x:(double)x y:(double)y width:(double)width height:(double)height;
+- (BOOL)navigateWebViewInWindow:(uint64_t)windowId label:(NSString *)label url:(NSString *)url;
+- (BOOL)setWebViewZoomInWindow:(uint64_t)windowId label:(NSString *)label zoom:(double)zoom;
+- (BOOL)setWebViewLayerInWindow:(uint64_t)windowId label:(NSString *)label layer:(NSInteger)layer;
+- (BOOL)closeWebViewInWindow:(uint64_t)windowId label:(NSString *)label;
+- (void)closeWebViewsInWindow:(uint64_t)windowId;
+- (NSView *)stackViewForWindowId:(uint64_t)windowId;
+- (void)reorderWebViewsInWindow:(uint64_t)windowId;
 - (void)setBrowser:(CefRefPtr<CefBrowser>)browser windowId:(uint64_t)windowId;
+- (BOOL)webViewGeneration:(uint64_t)generation matchesKey:(NSString *)key;
+- (void)setWebViewBrowser:(CefRefPtr<CefBrowser>)browser key:(NSString *)key generation:(uint64_t)generation;
+- (void)cleanupClosedWebViewWithKey:(NSString *)key;
+- (void)cleanupClosedWebViewWithKey:(NSString *)key generation:(uint64_t)generation;
 - (NSString *)fallbackURLForWindowId:(uint64_t)windowId;
 - (NSString *)bridgeOriginForWindowId:(uint64_t)windowId sourceURL:(NSString *)sourceURL;
-- (void)receiveBridgePayload:(NSString *)payload origin:(NSString *)origin windowId:(uint64_t)windowId;
+- (void)receiveBridgePayload:(NSString *)payload origin:(NSString *)origin windowId:(uint64_t)windowId webViewLabel:(NSString *)webViewLabel;
 - (void)completeBridgeWithResponse:(NSString *)response;
 - (void)completeBridgeWithResponse:(NSString *)response windowId:(uint64_t)windowId;
+- (void)completeBridgeWithResponse:(NSString *)response windowId:(uint64_t)windowId webViewLabel:(NSString *)webViewLabel;
 - (void)emitEventNamed:(NSString *)name detailJSON:(NSString *)detailJSON windowId:(uint64_t)windowId;
 - (void)trayMenuItemClicked:(NSMenuItem *)menuItem;
 @end
@@ -390,6 +466,7 @@ static const char *ZeroNativeCefBridgeScript() {
 - (void)windowWillClose:(NSNotification *)notification {
     (void)notification;
     [self.host emitWindowFrameForWindowId:self.windowId open:NO];
+    [self.host closeWebViewsInWindow:self.windowId];
     NSNumber *key = @(self.windowId);
     [self.host.windows removeObjectForKey:key];
     [self.host.browserContainers removeObjectForKey:key];
@@ -426,8 +503,16 @@ static const char *ZeroNativeCefBridgeScript() {
     self.internalURLPrefixes = [[NSMutableDictionary alloc] init];
     self.windowLabels = [[NSMutableDictionary alloc] init];
     self.fallbackURLs = [[NSMutableDictionary alloc] init];
+    self.webviewViews = [[NSMutableDictionary alloc] init];
+    self.webviewPendingURLs = [[NSMutableDictionary alloc] init];
+    self.webviewPendingZooms = [[NSMutableDictionary alloc] init];
+    self.webviewGenerations = [[NSMutableDictionary alloc] init];
+    self.closingWebViewKeys = [[NSMutableSet alloc] init];
+    self.nextWebViewGeneration = 1;
     self.cefClients = new std::map<uint64_t, CefRefPtr<ZeroNativeCefClient>>();
     self.browsers = new std::map<uint64_t, CefRefPtr<CefBrowser>>();
+    self.webviewCefClients = new std::map<std::string, CefRefPtr<ZeroNativeCefClient>>();
+    self.webviewBrowsers = new std::map<std::string, CefRefPtr<CefBrowser>>();
     self.allowedNavigationOrigins = @[ @"zero://app", @"zero://inline" ];
     self.allowedExternalURLs = @[];
     self.externalLinkAction = 0;
@@ -517,6 +602,8 @@ static const char *ZeroNativeCefBridgeScript() {
 }
 
 - (void)dealloc {
+    delete self.webviewCefClients;
+    delete self.webviewBrowsers;
     delete self.cefClients;
     delete self.browsers;
 }
@@ -536,9 +623,15 @@ static const char *ZeroNativeCefBridgeScript() {
     [window setTitle:title.length > 0 ? title : @"zero-native"];
     if (!restoreFrame) [window center];
 
-    NSView *browserContainer = [[NSView alloc] initWithFrame:rect];
+    NSView *stackRoot = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, width, height)];
+    stackRoot.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    window.contentView = stackRoot;
+
+    NSView *browserContainer = [[NSView alloc] initWithFrame:stackRoot.bounds];
     browserContainer.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-    window.contentView = browserContainer;
+    browserContainer.wantsLayer = YES;
+    browserContainer.layer.zPosition = 0;
+    [stackRoot addSubview:browserContainer positioned:NSWindowAbove relativeTo:nil];
 
     ZeroNativeChromiumWindowDelegate *delegate = [[ZeroNativeChromiumWindowDelegate alloc] init];
     delegate.host = self;
@@ -577,6 +670,7 @@ static const char *ZeroNativeCefBridgeScript() {
         if (!window) {
             return;
         }
+        [self closeWebViewsInWindow:windowId];
         if (self.browsers) {
             auto it = self.browsers->find(windowId);
             if (it != self.browsers->end() && it->second) {
@@ -645,14 +739,13 @@ static const char *ZeroNativeCefBridgeScript() {
 }
 
 - (void)emitResizeForWindowId:(uint64_t)windowId {
-    NSView *container = self.browserContainers[@(windowId)] ?: self.browserContainer;
     NSWindow *window = self.windows[@(windowId)] ?: self.window;
     CefRefPtr<CefBrowser> browser;
     if (self.browsers) {
         auto it = self.browsers->find(windowId);
         if (it != self.browsers->end()) browser = it->second;
     }
-    NSRect bounds = container.bounds;
+    NSRect bounds = window.contentView.bounds;
     if (browser) browser->GetHost()->WasResized();
     [self emitEvent:(zero_native_appkit_event_t){
         .kind = ZERO_NATIVE_APPKIT_EVENT_RESIZE,
@@ -747,7 +840,230 @@ static const char *ZeroNativeCefBridgeScript() {
     windowInfo.SetAsChild((__bridge void *)container, rect);
     CefBrowserSettings browserSettings;
     CefRefPtr<ZeroNativeCefClient> client = (*self.cefClients)[windowId];
-    CefBrowserHost::CreateBrowser(windowInfo, client.get(), std::string(urlString.UTF8String), browserSettings, nullptr, nullptr);
+    CefBrowserHost::CreateBrowser(windowInfo, client.get(), std::string(urlString.UTF8String), browserSettings, ZeroNativeCefExtraInfo(true), nullptr);
+}
+
+- (NSString *)webViewKeyForWindow:(uint64_t)windowId label:(NSString *)label {
+    return [NSString stringWithFormat:@"%llu:%@", windowId, label ?: @""];
+}
+
+- (NSView *)stackViewForWindowId:(uint64_t)windowId {
+    NSWindow *window = self.windows[@(windowId)] ?: (windowId == 1 ? self.window : nil);
+    return window.contentView;
+}
+
+- (NSRect)webViewFrameForContainer:(NSView *)container x:(double)x y:(double)y width:(double)width height:(double)height {
+    CGFloat nativeY = container.isFlipped ? y : container.bounds.size.height - y - height;
+    return NSMakeRect(x, nativeY, width, height);
+}
+
+- (BOOL)createWebViewInWindow:(uint64_t)windowId label:(NSString *)label url:(NSString *)url x:(double)x y:(double)y width:(double)width height:(double)height layer:(NSInteger)layer transparent:(BOOL)transparent bridgeEnabled:(BOOL)bridgeEnabled {
+    if (label.length == 0 || url.length == 0 || width <= 0 || height <= 0 || x < 0 || y < 0) return NO;
+    NSView *container = self.browserContainers[@(windowId)] ?: (windowId == 1 ? self.browserContainer : nil);
+    NSView *stackView = [self stackViewForWindowId:windowId];
+    if (!container || !stackView) return NO;
+    NSURL *targetURL = [NSURL URLWithString:url];
+    if (!targetURL || ![self allowsNavigationURL:targetURL]) return NO;
+    NSString *key = [self webViewKeyForWindow:windowId label:label];
+    if (self.webviewViews[key]) return NO;
+
+    NSView *webview = [[NSView alloc] initWithFrame:[self webViewFrameForContainer:stackView x:x y:y width:width height:height]];
+    webview.frame = [self webViewFrameForContainer:stackView x:x y:y width:width height:height];
+    webview.autoresizingMask = NSViewNotSizable;
+    webview.wantsLayer = YES;
+    webview.layer.zPosition = layer;
+    if (transparent) webview.layer.backgroundColor = NSColor.clearColor.CGColor;
+    [stackView addSubview:webview positioned:NSWindowAbove relativeTo:nil];
+    self.webviewViews[key] = webview;
+    uint64_t generation = self.nextWebViewGeneration++;
+    if (self.nextWebViewGeneration == 0) self.nextWebViewGeneration = 1;
+    self.webviewGenerations[key] = @(generation);
+    [self reorderWebViewsInWindow:windowId];
+
+    std::string keyString(key.UTF8String);
+    CefRefPtr<ZeroNativeCefClient> client = new ZeroNativeCefClient(self, windowId, keyString, generation, bridgeEnabled);
+    if (self.webviewCefClients) (*self.webviewCefClients)[keyString] = client;
+    CefWindowInfo windowInfo;
+    CefRect rect(0, 0, webview.bounds.size.width, webview.bounds.size.height);
+    windowInfo.SetAsChild((__bridge void *)webview, rect);
+    CefBrowserSettings browserSettings;
+    CefBrowserHost::CreateBrowser(windowInfo, client.get(), std::string(url.UTF8String), browserSettings, ZeroNativeCefExtraInfo(bridgeEnabled), nullptr);
+    return YES;
+}
+
+- (BOOL)setWebViewFrameInWindow:(uint64_t)windowId label:(NSString *)label x:(double)x y:(double)y width:(double)width height:(double)height {
+    if (label.length == 0 || width <= 0 || height <= 0 || x < 0 || y < 0) return NO;
+    NSView *container = self.browserContainers[@(windowId)] ?: (windowId == 1 ? self.browserContainer : nil);
+    if ([label isEqualToString:@"main"]) {
+        if (!container) return NO;
+        NSView *parent = [self stackViewForWindowId:windowId];
+        if (!parent) return NO;
+        container.autoresizingMask = NSViewNotSizable;
+        container.frame = [self webViewFrameForContainer:parent x:x y:y width:width height:height];
+        [self reorderWebViewsInWindow:windowId];
+        if (self.browsers) {
+            auto it = self.browsers->find(windowId);
+            if (it != self.browsers->end() && it->second) it->second->GetHost()->WasResized();
+        }
+        return YES;
+    }
+    NSView *webview = self.webviewViews[[self webViewKeyForWindow:windowId label:label]];
+    NSView *stackView = [self stackViewForWindowId:windowId];
+    if (!container || !stackView || !webview) return NO;
+    webview.frame = [self webViewFrameForContainer:stackView x:x y:y width:width height:height];
+    [self reorderWebViewsInWindow:windowId];
+    std::string keyString([self webViewKeyForWindow:windowId label:label].UTF8String);
+    if (self.webviewBrowsers) {
+        auto it = self.webviewBrowsers->find(keyString);
+        if (it != self.webviewBrowsers->end() && it->second) it->second->GetHost()->WasResized();
+    }
+    return YES;
+}
+
+- (BOOL)navigateWebViewInWindow:(uint64_t)windowId label:(NSString *)label url:(NSString *)url {
+    if (label.length == 0 || url.length == 0) return NO;
+    NSURL *targetURL = [NSURL URLWithString:url];
+    if (!targetURL || ![self allowsNavigationURL:targetURL]) return NO;
+    if ([label isEqualToString:@"main"]) {
+        if (self.browsers) {
+            auto it = self.browsers->find(windowId);
+            if (it != self.browsers->end() && it->second) {
+                it->second->GetMainFrame()->LoadURL(std::string(url.UTF8String));
+                return YES;
+            }
+        }
+        return NO;
+    }
+    NSView *webview = self.webviewViews[[self webViewKeyForWindow:windowId label:label]];
+    if (!webview) return NO;
+    std::string keyString([self webViewKeyForWindow:windowId label:label].UTF8String);
+    if (self.webviewBrowsers) {
+        auto it = self.webviewBrowsers->find(keyString);
+        if (it != self.webviewBrowsers->end() && it->second) {
+            it->second->GetMainFrame()->LoadURL(std::string(url.UTF8String));
+            return YES;
+        }
+    }
+    self.webviewPendingURLs[[self webViewKeyForWindow:windowId label:label]] = url;
+    return YES;
+}
+
+- (BOOL)setWebViewZoomInWindow:(uint64_t)windowId label:(NSString *)label zoom:(double)zoom {
+    if (label.length == 0 || zoom < 0.25 || zoom > 5.0) return NO;
+    const double zoomLevel = log(zoom) / log(1.2);
+    if ([label isEqualToString:@"main"]) {
+        if (self.browsers) {
+            auto it = self.browsers->find(windowId);
+            if (it != self.browsers->end() && it->second) {
+                it->second->GetHost()->SetZoomLevel(zoomLevel);
+                return YES;
+            }
+        }
+        return NO;
+    }
+    NSString *key = [self webViewKeyForWindow:windowId label:label];
+    if (!self.webviewViews[key]) return NO;
+    std::string keyString(key.UTF8String);
+    if (self.webviewBrowsers) {
+        auto it = self.webviewBrowsers->find(keyString);
+        if (it != self.webviewBrowsers->end() && it->second) {
+            it->second->GetHost()->SetZoomLevel(zoomLevel);
+            [self.webviewPendingZooms removeObjectForKey:key];
+            return YES;
+        }
+    }
+    self.webviewPendingZooms[key] = @(zoom);
+    return YES;
+}
+
+- (BOOL)setWebViewLayerInWindow:(uint64_t)windowId label:(NSString *)label layer:(NSInteger)layer {
+    if (label.length == 0) return NO;
+    if ([label isEqualToString:@"main"]) {
+        NSView *container = self.browserContainers[@(windowId)] ?: (windowId == 1 ? self.browserContainer : nil);
+        if (!container) return NO;
+        container.wantsLayer = YES;
+        container.layer.zPosition = layer;
+        [self reorderWebViewsInWindow:windowId];
+        return YES;
+    }
+    NSView *webview = self.webviewViews[[self webViewKeyForWindow:windowId label:label]];
+    if (!webview) return NO;
+    webview.wantsLayer = YES;
+    webview.layer.zPosition = layer;
+    [self reorderWebViewsInWindow:windowId];
+    return YES;
+}
+
+- (BOOL)closeWebViewInWindow:(uint64_t)windowId label:(NSString *)label {
+    NSString *key = [self webViewKeyForWindow:windowId label:label];
+    if ([self.closingWebViewKeys containsObject:key]) return YES;
+    NSView *webview = self.webviewViews[key];
+    if (!webview) return NO;
+    std::string keyString(key.UTF8String);
+    [self.closingWebViewKeys addObject:key];
+    [self.webviewPendingURLs removeObjectForKey:key];
+    [self.webviewPendingZooms removeObjectForKey:key];
+    CefRefPtr<CefBrowser> browser;
+    if (self.webviewBrowsers) {
+        auto browser_it = self.webviewBrowsers->find(keyString);
+        if (browser_it != self.webviewBrowsers->end() && browser_it->second) {
+            browser = browser_it->second;
+        }
+    }
+    if (browser) browser->GetHost()->CloseBrowser(true);
+    [self cleanupClosedWebViewWithKey:key];
+    return YES;
+}
+
+- (void)closeWebViewsInWindow:(uint64_t)windowId {
+    NSString *prefix = [NSString stringWithFormat:@"%llu:", windowId];
+    NSArray<NSString *> *keys = [self.webviewViews.allKeys copy];
+    for (NSString *key in keys) {
+        if (![key hasPrefix:prefix]) continue;
+        NSRange separator = [key rangeOfString:@":"];
+        NSString *label = separator.location == NSNotFound ? key : [key substringFromIndex:separator.location + 1];
+        [self closeWebViewInWindow:windowId label:label];
+    }
+}
+
+- (void)reorderWebViewsInWindow:(uint64_t)windowId {
+    NSView *stackView = [self stackViewForWindowId:windowId];
+    if (!stackView) return;
+
+    NSMutableArray<NSView *> *views = [[NSMutableArray alloc] init];
+    NSView *mainView = self.browserContainers[@(windowId)] ?: (windowId == 1 ? self.browserContainer : nil);
+    if (mainView && mainView.superview == stackView) {
+        mainView.wantsLayer = YES;
+        [views addObject:mainView];
+    }
+
+    NSString *prefix = [NSString stringWithFormat:@"%llu:", windowId];
+    for (NSString *key in self.webviewViews) {
+        if (![key hasPrefix:prefix]) continue;
+        NSView *webView = self.webviewViews[key];
+        if (webView && webView.superview == stackView) {
+            webView.wantsLayer = YES;
+            [views addObject:webView];
+        }
+    }
+
+    [views sortUsingComparator:^NSComparisonResult(NSView *first, NSView *second) {
+        CGFloat firstLayer = first.layer.zPosition;
+        CGFloat secondLayer = second.layer.zPosition;
+        if (firstLayer < secondLayer) return NSOrderedAscending;
+        if (firstLayer > secondLayer) return NSOrderedDescending;
+        NSUInteger firstIndex = [stackView.subviews indexOfObjectIdenticalTo:first];
+        NSUInteger secondIndex = [stackView.subviews indexOfObjectIdenticalTo:second];
+        if (firstIndex < secondIndex) return NSOrderedAscending;
+        if (firstIndex > secondIndex) return NSOrderedDescending;
+        return NSOrderedSame;
+    }];
+
+    NSView *previous = nil;
+    for (NSView *view in views) {
+        [stackView addSubview:view positioned:NSWindowAbove relativeTo:previous];
+        previous = view;
+    }
 }
 
 - (void)setAllowedNavigationOrigins:(NSArray<NSString *> *)origins externalURLs:(NSArray<NSString *> *)externalURLs externalAction:(NSInteger)externalAction {
@@ -784,6 +1100,48 @@ static const char *ZeroNativeCefBridgeScript() {
     if (windowId == 1) self.browser = browser;
 }
 
+- (BOOL)webViewGeneration:(uint64_t)generation matchesKey:(NSString *)key {
+    NSNumber *current = self.webviewGenerations[key];
+    return current && current.unsignedLongLongValue == generation;
+}
+
+- (void)setWebViewBrowser:(CefRefPtr<CefBrowser>)browser key:(NSString *)key generation:(uint64_t)generation {
+    if (!self.webviewBrowsers || key.length == 0) return;
+    if (![self webViewGeneration:generation matchesKey:key] || [self.closingWebViewKeys containsObject:key]) {
+        if (browser) browser->GetHost()->CloseBrowser(true);
+        return;
+    }
+    (*self.webviewBrowsers)[std::string(key.UTF8String)] = browser;
+    NSString *pendingURL = self.webviewPendingURLs[key];
+    if (pendingURL.length > 0 && browser) {
+        browser->GetMainFrame()->LoadURL(std::string(pendingURL.UTF8String));
+        [self.webviewPendingURLs removeObjectForKey:key];
+    }
+    NSNumber *pendingZoom = self.webviewPendingZooms[key];
+    if (pendingZoom && browser) {
+        browser->GetHost()->SetZoomLevel(log(pendingZoom.doubleValue) / log(1.2));
+        [self.webviewPendingZooms removeObjectForKey:key];
+    }
+}
+
+- (void)cleanupClosedWebViewWithKey:(NSString *)key {
+    if (key.length == 0) return;
+    std::string keyString(key.UTF8String);
+    if (self.webviewBrowsers) self.webviewBrowsers->erase(keyString);
+    if (self.webviewCefClients) self.webviewCefClients->erase(keyString);
+    [self.webviewPendingURLs removeObjectForKey:key];
+    [self.webviewPendingZooms removeObjectForKey:key];
+    [self.webviewGenerations removeObjectForKey:key];
+    [self.webviewViews[key] removeFromSuperview];
+    [self.webviewViews removeObjectForKey:key];
+    [self.closingWebViewKeys removeObject:key];
+}
+
+- (void)cleanupClosedWebViewWithKey:(NSString *)key generation:(uint64_t)generation {
+    if (![self webViewGeneration:generation matchesKey:key]) return;
+    [self cleanupClosedWebViewWithKey:key];
+}
+
 - (NSString *)fallbackURLForWindowId:(uint64_t)windowId {
     return self.fallbackURLs[@(windowId)];
 }
@@ -794,28 +1152,39 @@ static const char *ZeroNativeCefBridgeScript() {
     return ZeroNativeOriginForURL([NSURL URLWithString:sourceURL]);
 }
 
-- (void)receiveBridgePayload:(NSString *)payload origin:(NSString *)origin windowId:(uint64_t)windowId {
+- (void)receiveBridgePayload:(NSString *)payload origin:(NSString *)origin windowId:(uint64_t)windowId webViewLabel:(NSString *)webViewLabel {
     if (!self.bridgeCallback) return;
     NSData *payloadData = [payload dataUsingEncoding:NSUTF8StringEncoding] ?: [NSData data];
     NSData *originData = [origin dataUsingEncoding:NSUTF8StringEncoding] ?: [NSData data];
-    self.bridgeCallback(self.bridgeContext, windowId, (const char *)payloadData.bytes, payloadData.length, (const char *)originData.bytes, originData.length);
+    NSData *labelData = [(webViewLabel.length > 0 ? webViewLabel : @"main") dataUsingEncoding:NSUTF8StringEncoding] ?: [NSData data];
+    self.bridgeCallback(self.bridgeContext, windowId, (const char *)labelData.bytes, labelData.length, (const char *)payloadData.bytes, payloadData.length, (const char *)originData.bytes, originData.length);
 }
 
 - (void)completeBridgeWithResponse:(NSString *)response {
-    [self completeBridgeWithResponse:response windowId:1];
+    [self completeBridgeWithResponse:response windowId:1 webViewLabel:@"main"];
 }
 
 - (void)completeBridgeWithResponse:(NSString *)response windowId:(uint64_t)windowId {
+    [self completeBridgeWithResponse:response windowId:windowId webViewLabel:@"main"];
+}
+
+- (void)completeBridgeWithResponse:(NSString *)response windowId:(uint64_t)windowId webViewLabel:(NSString *)webViewLabel {
     CefRefPtr<CefBrowser> browser;
-    if (self.browsers) {
+    NSString *label = webViewLabel.length > 0 ? webViewLabel : @"main";
+    if ([label isEqualToString:@"main"] && self.browsers) {
         auto it = self.browsers->find(windowId);
         if (it != self.browsers->end()) browser = it->second;
+    } else if (self.webviewBrowsers) {
+        std::string key = std::string([[self webViewKeyForWindow:windowId label:label] UTF8String]);
+        auto it = self.webviewBrowsers->find(key);
+        if (it != self.webviewBrowsers->end()) browser = it->second;
     }
     if (!browser) return;
     CefRefPtr<CefFrame> frame = browser->GetMainFrame();
     if (!frame) return;
     NSString *script = [NSString stringWithFormat:@"window.zero&&window.zero._complete(%@);", response.length > 0 ? response : @"{}"];
-    frame->ExecuteJavaScript(std::string(script.UTF8String), frame->GetURL(), 0);
+    std::string scriptString(script.UTF8String);
+    frame->ExecuteJavaScript(scriptString, frame->GetURL(), 0);
 }
 
 - (void)emitEventNamed:(NSString *)name detailJSON:(NSString *)detailJSON windowId:(uint64_t)windowId {
@@ -881,7 +1250,19 @@ static BOOL ZeroNativePolicyListMatches(NSArray<NSString *> *values, NSURL *url)
 }
 
 void ZeroNativeCefClient::OnAfterCreated(CefRefPtr<CefBrowser> browser) {
+    if (!webview_key_.empty()) {
+        NSString *key = [[NSString alloc] initWithBytes:webview_key_.data() length:webview_key_.size() encoding:NSUTF8StringEncoding];
+        [host_ setWebViewBrowser:browser key:key ?: @"" generation:webview_generation_];
+        return;
+    }
     [host_ setBrowser:browser windowId:window_id_];
+}
+
+void ZeroNativeCefClient::OnBeforeClose(CefRefPtr<CefBrowser> browser) {
+    (void)browser;
+    if (webview_key_.empty()) return;
+    NSString *key = [[NSString alloc] initWithBytes:webview_key_.data() length:webview_key_.size() encoding:NSUTF8StringEncoding];
+    [host_ cleanupClosedWebViewWithKey:key ?: @"" generation:webview_generation_];
 }
 
 void ZeroNativeCefClient::OnLoadError(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, ErrorCode errorCode, const CefString& errorText, const CefString& failedUrl) {
@@ -913,13 +1294,18 @@ bool ZeroNativeCefClient::OnProcessMessageReceived(CefRefPtr<CefBrowser> browser
     (void)browser;
     (void)source_process;
     if (message->GetName() != kBridgeMessageName) return false;
+    if (!bridge_enabled_) return true;
 
     std::string payload = message->GetArgumentList()->GetString(0);
     std::string source_url = frame ? frame->GetURL().ToString() : std::string();
+    std::string label = WebViewLabel();
     NSString *payloadString = [[NSString alloc] initWithBytes:payload.data() length:payload.size() encoding:NSUTF8StringEncoding] ?: @"{}";
     NSString *sourceURLString = [[NSString alloc] initWithBytes:source_url.data() length:source_url.size() encoding:NSUTF8StringEncoding] ?: @"";
-    NSString *originString = [host_ bridgeOriginForWindowId:window_id_ sourceURL:sourceURLString];
-    [host_ receiveBridgePayload:payloadString origin:originString windowId:window_id_];
+    NSString *labelString = [[NSString alloc] initWithBytes:label.data() length:label.size() encoding:NSUTF8StringEncoding] ?: @"main";
+    NSString *originString = [labelString isEqualToString:@"main"]
+        ? [host_ bridgeOriginForWindowId:window_id_ sourceURL:sourceURLString]
+        : ZeroNativeOriginForURL([NSURL URLWithString:sourceURLString]);
+    [host_ receiveBridgePayload:payloadString origin:originString windowId:window_id_ webViewLabel:labelString];
     return true;
 }
 
@@ -994,6 +1380,13 @@ void zero_native_appkit_bridge_respond_window(zero_native_appkit_host_t *host, u
     [object completeBridgeWithResponse:responseString ?: @"{}" windowId:window_id];
 }
 
+void zero_native_appkit_bridge_respond_webview(zero_native_appkit_host_t *host, uint64_t window_id, const char *webview_label, size_t webview_label_len, const char *response, size_t response_len) {
+    ZeroNativeChromiumHost *object = (__bridge ZeroNativeChromiumHost *)host;
+    NSString *labelString = webview_label ? [[NSString alloc] initWithBytes:webview_label length:webview_label_len encoding:NSUTF8StringEncoding] : @"main";
+    NSString *responseString = response ? [[NSString alloc] initWithBytes:response length:response_len encoding:NSUTF8StringEncoding] : @"{}";
+    [object completeBridgeWithResponse:responseString ?: @"{}" windowId:window_id webViewLabel:labelString ?: @"main"];
+}
+
 void zero_native_appkit_emit_window_event(zero_native_appkit_host_t *host, uint64_t window_id, const char *name, size_t name_len, const char *detail_json, size_t detail_json_len) {
     ZeroNativeChromiumHost *object = (__bridge ZeroNativeChromiumHost *)host;
     NSString *nameString = name ? [[NSString alloc] initWithBytes:name length:name_len encoding:NSUTF8StringEncoding] : @"";
@@ -1027,6 +1420,44 @@ int zero_native_appkit_close_window(zero_native_appkit_host_t *host, uint64_t wi
     if (!object.windows[@(window_id)]) return 0;
     [object closeWindowWithId:window_id];
     return 1;
+}
+
+int zero_native_appkit_create_webview(zero_native_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len, const char *url, size_t url_len, double x, double y, double width, double height, int layer, int transparent, int bridge_enabled) {
+    ZeroNativeChromiumHost *object = (__bridge ZeroNativeChromiumHost *)host;
+    NSString *labelString = label ? [[NSString alloc] initWithBytes:label length:label_len encoding:NSUTF8StringEncoding] : @"";
+    NSString *urlString = url ? [[NSString alloc] initWithBytes:url length:url_len encoding:NSUTF8StringEncoding] : @"";
+    return [object createWebViewInWindow:window_id label:labelString ?: @"" url:urlString ?: @"" x:x y:y width:width height:height layer:layer transparent:transparent != 0 bridgeEnabled:bridge_enabled != 0] ? 1 : 0;
+}
+
+int zero_native_appkit_set_webview_frame(zero_native_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len, double x, double y, double width, double height) {
+    ZeroNativeChromiumHost *object = (__bridge ZeroNativeChromiumHost *)host;
+    NSString *labelString = label ? [[NSString alloc] initWithBytes:label length:label_len encoding:NSUTF8StringEncoding] : @"";
+    return [object setWebViewFrameInWindow:window_id label:labelString ?: @"" x:x y:y width:width height:height] ? 1 : 0;
+}
+
+int zero_native_appkit_navigate_webview(zero_native_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len, const char *url, size_t url_len) {
+    ZeroNativeChromiumHost *object = (__bridge ZeroNativeChromiumHost *)host;
+    NSString *labelString = label ? [[NSString alloc] initWithBytes:label length:label_len encoding:NSUTF8StringEncoding] : @"";
+    NSString *urlString = url ? [[NSString alloc] initWithBytes:url length:url_len encoding:NSUTF8StringEncoding] : @"";
+    return [object navigateWebViewInWindow:window_id label:labelString ?: @"" url:urlString ?: @""] ? 1 : 0;
+}
+
+int zero_native_appkit_set_webview_zoom(zero_native_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len, double zoom) {
+    ZeroNativeChromiumHost *object = (__bridge ZeroNativeChromiumHost *)host;
+    NSString *labelString = label ? [[NSString alloc] initWithBytes:label length:label_len encoding:NSUTF8StringEncoding] : @"";
+    return [object setWebViewZoomInWindow:window_id label:labelString ?: @"" zoom:zoom] ? 1 : 0;
+}
+
+int zero_native_appkit_set_webview_layer(zero_native_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len, int layer) {
+    ZeroNativeChromiumHost *object = (__bridge ZeroNativeChromiumHost *)host;
+    NSString *labelString = label ? [[NSString alloc] initWithBytes:label length:label_len encoding:NSUTF8StringEncoding] : @"";
+    return [object setWebViewLayerInWindow:window_id label:labelString ?: @"" layer:layer] ? 1 : 0;
+}
+
+int zero_native_appkit_close_webview(zero_native_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len) {
+    ZeroNativeChromiumHost *object = (__bridge ZeroNativeChromiumHost *)host;
+    NSString *labelString = label ? [[NSString alloc] initWithBytes:label length:label_len encoding:NSUTF8StringEncoding] : @"";
+    return [object closeWebViewInWindow:window_id label:labelString ?: @""] ? 1 : 0;
 }
 
 size_t zero_native_appkit_clipboard_read(zero_native_appkit_host_t *host, char *buffer, size_t buffer_len) {
