@@ -81,6 +81,16 @@ function normalizeUrl(value) {
   return "https://" + trimmed;
 }
 
+function canonicalUrlKey(value) {
+  var trimmed = String(value || "").trim();
+  if (!trimmed) return "";
+  try {
+    return new URL(trimmed).href;
+  } catch (_) {
+    return trimmed.toLowerCase();
+  }
+}
+
 function toolbarHeight() {
   var toolbarRect = toolbar.getBoundingClientRect();
   return Math.ceil(toolbarRect.height);
@@ -179,7 +189,7 @@ function remember(url) {
 
 function updateAddressFromPage(url, options) {
   options = options || {};
-  if (!url || url === currentUrl) return;
+  if (!url || canonicalUrlKey(url) === canonicalUrlKey(currentUrl)) return;
   currentUrl = url;
   addressInput.value = url;
   updateSecurityIndicator(url);
@@ -189,8 +199,13 @@ function updateAddressFromPage(url, options) {
 }
 
 function trackVisited(url) {
+  var key = canonicalUrlKey(url);
+  if (!key) return;
   for (var i = 0; i < visitedUrls.length; i++) {
-    if (visitedUrls[i] === url) return;
+    if (canonicalUrlKey(visitedUrls[i]) === key) {
+      visitedUrls.splice(i, 1);
+      break;
+    }
   }
   visitedUrls.unshift(url);
   if (visitedUrls.length > 200) visitedUrls.length = 200;
@@ -226,11 +241,15 @@ function filterSuggestions(query) {
   if (!query) return [];
   var q = query.toLowerCase();
   var results = [];
+  var seen = Object.create(null);
   for (var i = 0; i < visitedUrls.length; i++) {
-    if (visitedUrls[i].toLowerCase().indexOf(q) !== -1) {
-      results.push(visitedUrls[i]);
-      if (results.length >= 8) break;
-    }
+    var url = visitedUrls[i];
+    var key = canonicalUrlKey(url);
+    var matches = url.toLowerCase().indexOf(q) !== -1 || key.toLowerCase().indexOf(q) !== -1;
+    if (seen[key] || !matches) continue;
+    seen[key] = true;
+    results.push(url);
+    if (results.length >= 8) break;
   }
   return results;
 }
