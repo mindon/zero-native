@@ -111,7 +111,7 @@ pub const Runtime = struct {
     last_invalidation_reason: InvalidationReason = .startup,
     last_diagnostics: FrameDiagnostics = .{},
     loaded_source: ?platform.WebViewSource = null,
-    async_bridge_responses: [max_async_bridge_responses]AsyncBridgeResponseSlot = [_]AsyncBridgeResponseSlot{.{}} ** max_async_bridge_responses,
+    async_bridge_responses: [max_async_bridge_responses]AsyncBridgeResponseSlot = @splat(.{}),
     automation_windows: [automation.snapshot.max_windows]automation.snapshot.Window = undefined,
 
     pub fn init(options: Options) Runtime {
@@ -1404,7 +1404,7 @@ test "runtime loads app source into platform webview" {
 
 test "runtime rejects oversized webview source" {
     const TestApp = struct {
-        bytes: [platform.max_window_source_bytes + 1]u8 = [_]u8{'x'} ** (platform.max_window_source_bytes + 1),
+        bytes: [platform.max_window_source_bytes + 1]u8 = @splat('x'),
 
         fn app(self: *@This()) App {
             return .{ .context = self, .name = "oversized-source", .source = platform.WebViewSource.html(&self.bytes) };
@@ -1986,7 +1986,7 @@ test "runtime validates webview bridge commands" {
     try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "WebView was not found") != null);
     try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"invalid_request\"") != null);
 
-    var long_label = [_]u8{'a'} ** (platform.max_webview_label_bytes + 1);
+    var long_label = @as([platform.max_webview_label_bytes + 1]u8, @splat('a'));
     var long_label_request_buffer: [512]u8 = undefined;
     const long_label_request = try std.fmt.bufPrint(&long_label_request_buffer, "{{\"id\":\"long-label\",\"command\":\"zero-native.webview.create\",\"payload\":{{\"label\":\"{s}\",\"url\":\"https://example.com\",\"frame\":{{\"width\":300,\"height\":200}}}}}}", .{&long_label});
     try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
@@ -1997,7 +1997,7 @@ test "runtime validates webview bridge commands" {
     try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "WebView label is too large") != null);
     try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"invalid_request\"") != null);
 
-    var long_url = [_]u8{'a'} ** (platform.max_webview_url_bytes + 1);
+    var long_url = @as([platform.max_webview_url_bytes + 1]u8, @splat('a'));
     var long_url_request_buffer: [platform.max_webview_url_bytes + 256]u8 = undefined;
     const long_url_request = try std.fmt.bufPrint(&long_url_request_buffer, "{{\"id\":\"long-url\",\"command\":\"zero-native.webview.create\",\"payload\":{{\"label\":\"too-long-url\",\"url\":\"{s}\",\"frame\":{{\"width\":300,\"height\":200}}}}}}", .{&long_url});
     try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
